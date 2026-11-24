@@ -126,9 +126,11 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
     def _async_update_device_registry(self) -> None:
         details = self.driver.details
         registry = dr.async_get(self.hass)
-        device = registry.async_get_device(connections={(dr.CONNECTION_BLUETOOTH, self.address)})
-        if device is None:
+        # This entry owns exactly one device (all entities share its DeviceInfo).
+        devices = dr.async_entries_for_config_entry(registry, self.entry.entry_id)
+        if not devices:
             return
+        device = devices[0]
         changes = {
             k: v
             for k, v in (

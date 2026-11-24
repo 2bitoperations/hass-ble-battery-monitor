@@ -152,6 +152,10 @@ async def test_bk400_poll_creates_sensors(
     assert coordinator.last_poll_successful, coordinator.last_error
     assert hass.states.get("sensor.bk400_1234_voltage").state == "12.65"
     assert hass.states.get("sensor.bk400_1234_temperature").state == "21.4"
+    from homeassistant.helpers import device_registry as dr
+
+    (device,) = dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)
+    assert (device.model, device.sw_version, device.hw_version) == ("BK400", "V2.3", "V1.0")
     assert hass.states.get("sensor.bk400_1234_state_of_charge") is None  # BK400 doesn't report SoC
     assert entity_registry.async_get("sensor.bk400_1234_signal_strength").disabled_by is not None
     assert await hass.config_entries.async_unload(entry.entry_id)
