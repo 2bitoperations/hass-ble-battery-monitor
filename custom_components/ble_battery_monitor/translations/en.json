@@ -1,0 +1,49 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "bluetooth_confirm": {
+        "description": "Set up {name} ({address})?"
+      },
+      "user": {
+        "description": "Choose a battery monitor. Only supported monitors that a Bluetooth adapter or proxy can currently hear are listed.",
+        "data": {
+          "address": "Device"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This monitor is already configured.",
+      "no_devices_found": "No supported battery monitors are in range of a connectable Bluetooth adapter or proxy.",
+      "not_supported": "This device is not a supported battery monitor."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "poll_interval": "Poll interval"
+        },
+        "data_description": {
+          "poll_interval": "How often to connect and read the monitor. Each poll connects for a few seconds, then disconnects."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "soc": {
+        "name": "State of charge"
+      },
+      "state": {
+        "name": "Battery state",
+        "state": {
+          "ok": "OK",
+          "low_voltage": "Low voltage",
+          "charging": "Charging",
+          "unknown": "Unknown"
+        }
+      }
+    }
+  }
+}
