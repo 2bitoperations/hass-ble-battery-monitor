@@ -1,24 +1,90 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uvx ruff check . && uvx ruff format --check .
-      - run: |
+      - name: Lint
+        run: uvx ruff check . && uvx ruff format --check .
+      - name: Tests
+        run: |
           uv venv -p 3.14
-          uv pip install pytest-homeassistant-custom-component bleak bleak-retry-connector habluetooth bluetooth-adapters bluetooth-auto-recovery bluetooth-data-tools dbus-fast aiousbwatcher serialx
+          uv pip install pytest-homeassistant-custom-component \
+            bleak bleak-retry-connector habluetooth bluetooth-adapters \
+            bluetooth-auto-recovery bluetooth-data-tools dbus-fast aiousbwatcher serialx
           uv run pytest -q
+
   hassfest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: home-assistant/actions/hassfest@master
+
   hacs:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: hacs/action@main
         with:
           category: integration
+          # Not submitted to the HACS default store; installed as a custom repository.
+          ignore: brands
+
+  release:
+    # Every push to main that passes CI becomes a new patch release.
+    needs: [test, hassfest, hacs]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      !contains(github.event.head_commit.message, '[skip release]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump patch version in manifest.json
+        id: bump
+        run: |
+          M=custom_components/ble_battery_monitor/manifest.json
+          VERSION=$(jq -r .version "$M")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          # If the tag already exists (e.g. manual tag), keep bumping.
+          while git rev-parse -q --verify "refs/tags/v$NEW" >/dev/null; do
+            PATCH=$((PATCH + 1)); NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          done
+          jq --arg v "$NEW" '.version = $v' "$M" > /tmp/m.json && mv /tmp/m.json "$M"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add custom_components/ble_battery_monitor/manifest.json
+          git commit -m "chore: release v${{ steps.bump.outputs.version }} [skip release]"
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push origin HEAD:main
+          git push origin "v${{ steps.bump.outputs.version }}"
+
+      - name: Package
+        run: cd custom_components/ble_battery_monitor && zip -r ../../ble_battery_monitor.zip . -x '__pycache__/*'
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.bump.outputs.version }}
+          name: v${{ steps.bump.outputs.version }}
+          files: ble_battery_monitor.zip
+          generate_release_notes: true

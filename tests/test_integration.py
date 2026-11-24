@@ -200,9 +200,7 @@ async def test_bm2_discovery_with_name_then_poll(hass: HomeAssistant) -> None:
         DOMAIN, context={"source": SOURCE_BLUETOOTH}, data=BM2
     )
     assert result["step_id"] == "bluetooth_confirm"
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {"name": "Tractor"}
-    )
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"name": "Tractor"})
     assert result["type"] is FlowResultType.CREATE_ENTRY and result["title"] == "Tractor"
     assert result["data"][CONF_MODEL] == "BM2"
     data = dict(result["data"])

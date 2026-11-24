@@ -33,11 +33,25 @@ Drivers only send what the vendor apps send on every connect. They never send fi
 data-delete, rename or factory/calibration commands. On a KONNWEI device that reports firmware-update
 mode, the driver stops after the first query.
 
-## Install (manual)
+## Install
 
-Copy `custom_components/ble_battery_monitor` into your HA `config/custom_components/`, restart, then
-add **BLE Battery Monitor** (or accept the discovery). You need a connectable adapter or an ESPHome
-proxy with `bluetooth_proxy: active: true` in range.
+You need a connectable Bluetooth adapter, or an ESPHome proxy with `bluetooth_proxy: active: true`, in
+range of the monitor.
+
+**HACS (custom repository; this integration isn't in the HACS default list):** go to HACS → ⋮ →
+*Custom repositories*, add `https://github.com/2bitoperations/hass-ble-battery-monitor` as type
+**Integration**, then download **BLE Battery Monitor** and restart Home Assistant. Monitors in range
+show up as discovered devices, or you can add them from **Add integration → BLE Battery Monitor**.
+
+**Manual:** copy `custom_components/ble_battery_monitor` from the latest
+[release](https://github.com/2bitoperations/hass-ble-battery-monitor/releases) into
+`config/custom_components/` and restart.
+
+## Releases
+
+Every push to `main` that passes CI (tests, ruff, hassfest, HACS validation) is released automatically.
+The workflow bumps the patch version in `manifest.json`, tags `vX.Y.Z`, and publishes a GitHub release,
+which HACS offers as an update. To skip a release, put `[skip release]` in the commit message.
 
 ## Development
 
