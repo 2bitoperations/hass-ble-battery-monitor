@@ -8,13 +8,14 @@ Bluetooth stack so it works through ESPHome Bluetooth proxies.
 | KONNWEI | BK400 | tested in simulation, live test pending | voltage, temperature |
 | KONNWEI | BK300 | untested (same framing, uses the `0B0B` voltage poll) | voltage, temperature if supported |
 | Leagend | BM6 | tested in simulation, live test pending | voltage, temperature, state of charge, state |
-| Leagend | BM2, BM7 | not yet | |
+| Leagend | BM2 ("Battery Monitor", ZX-1689) | tested in simulation, live test pending | voltage, state of charge |
+| Leagend | BM7 | not yet | |
 
 ## How it works
 
 - **Discovery:** precise advert matchers.
   - KONNWEI: service FFF0, plus manufacturer data that spells the device's own MAC.
-  - BM6: its iBeacon UUID or manufacturer-data prefixes, or a `BM6*` name.
+  - BM6 / BM2: their iBeacon UUIDs or manufacturer-data prefixes, a `BM6*` name, or a BM2 name together with FFF0.
 
   It doesn't claim every FFF0 device.
 - **Polling:** advertisement-triggered. When the monitor is heard and a poll is due, it connects,

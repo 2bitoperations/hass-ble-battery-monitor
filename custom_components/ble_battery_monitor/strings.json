@@ -3,12 +3,22 @@
     "flow_title": "{name}",
     "step": {
       "bluetooth_confirm": {
-        "description": "Set up {name} ({address})?"
+        "description": "Set up {name} ({address})?",
+        "data": {
+          "name": "Name"
+        },
+        "data_description": {
+          "name": "Shown as the device name, e.g. the vehicle the battery is in."
+        }
       },
       "user": {
         "description": "Choose a battery monitor. Only supported monitors that a Bluetooth adapter or proxy can currently hear are listed.",
         "data": {
-          "address": "Device"
+          "address": "Device",
+          "name": "Name"
+        },
+        "data_description": {
+          "name": "Optional. Defaults to the model and the end of the address."
         }
       }
     },

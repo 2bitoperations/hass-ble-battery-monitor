@@ -20,7 +20,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.ble_battery_monitor.const import CONF_DRIVER, CONF_MODEL, DOMAIN
 from custom_components.ble_battery_monitor.drivers import konnwei
 
-from .fakes import bm6_device, konnwei_device
+from .fakes import bm2_device, bm6_device, konnwei_device
 
 FFF0 = "0000fff0-0000-1000-8000-00805f9b34fb"
 
@@ -60,6 +60,7 @@ BM2 = service_info(
     [FFF0],
     "Battery Monitor",
 )
+SHIELD = service_info("AA:BB:CC:DD:EE:FF", {}, [FFF0], "SHIELD Remote")
 
 
 @pytest.fixture(autouse=True)
@@ -86,7 +87,7 @@ async def test_bluetooth_discovery_creates_entry(hass: HomeAssistant) -> None:
 
 async def test_unsupported_discovery_aborts(hass: HomeAssistant) -> None:
     result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": SOURCE_BLUETOOTH}, data=BM2
+        DOMAIN, context={"source": SOURCE_BLUETOOTH}, data=SHIELD
     )
     assert result["type"] is FlowResultType.ABORT and result["reason"] == "not_supported"
 
@@ -94,7 +95,7 @@ async def test_unsupported_discovery_aborts(hass: HomeAssistant) -> None:
 async def test_user_flow_lists_only_supported(hass: HomeAssistant) -> None:
     with patch(
         "custom_components.ble_battery_monitor.config_flow.async_discovered_service_info",
-        return_value=[BK400, BM2],
+        return_value=[BK400, SHIELD],
     ):
         result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
         assert result["type"] is FlowResultType.FORM
@@ -109,7 +110,7 @@ async def test_user_flow_lists_only_supported(hass: HomeAssistant) -> None:
 async def test_user_flow_nothing_found(hass: HomeAssistant) -> None:
     with patch(
         "custom_components.ble_battery_monitor.config_flow.async_discovered_service_info",
-        return_value=[BM2],
+        return_value=[SHIELD],
     ):
         result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
     assert result["type"] is FlowResultType.ABORT and result["reason"] == "no_devices_found"
@@ -185,3 +186,24 @@ async def test_failed_poll_leaves_entities_unavailable(hass: HomeAssistant) -> N
     assert not coordinator.last_poll_successful
     assert "no voltage" in coordinator.last_error
     assert hass.states.get("sensor.bk400_1234_voltage").state == "unavailable"
+
+
+async def test_bm2_discovery_with_name_then_poll(hass: HomeAssistant) -> None:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_BLUETOOTH}, data=BM2
+    )
+    assert result["step_id"] == "bluetooth_confirm"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"name": "Tractor"}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY and result["title"] == "Tractor"
+    assert result["data"][CONF_MODEL] == "BM2"
+    data = dict(result["data"])
+    await hass.config_entries.async_remove(result["result"].entry_id)
+    await hass.async_block_till_done()
+
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=BM2.address, title="Tractor", data=data)
+    await _setup_and_poll(hass, entry, BM2, bm2_device(volts=12.68, soc=76))
+    assert hass.states.get("sensor.tractor_voltage").state == "12.68"
+    assert hass.states.get("sensor.tractor_state_of_charge").state == "76"
+    assert hass.states.get("sensor.tractor_temperature") is None

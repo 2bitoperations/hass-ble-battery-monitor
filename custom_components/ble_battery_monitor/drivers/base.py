@@ -63,7 +63,7 @@ class Driver(ABC):
     key: ClassVar[str]
     manufacturer: ClassVar[str]
     #: Reading fields this driver can fill; only these get entities.
-    sensors: ClassVar[frozenset[str]]
+    sensors: frozenset[str]
 
     def __init__(self, model: str) -> None:
         """Initialize for a detected model."""

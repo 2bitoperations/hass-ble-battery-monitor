@@ -136,3 +136,26 @@ def bm6_device(
             client.notify("fff4", leagend.encrypt(msg))
 
     return FakeClient("50:54:7B:00:00:B6", [svc], on_write)
+
+
+def bm2_device(*, volts: float = 12.68, soc: int = 76, interval: float = 0.2) -> FakeClient:
+    """BM2: streams F5 packets once notifications are on; writes nothing."""
+    svc = FakeService(
+        uuid16("fff0"),
+        [FakeChar(uuid16("fff3"), ["write"]), FakeChar(uuid16("fff4"), ["notify"])],
+    )
+
+    class BM2Client(FakeClient):
+        async def start_notify(self, char: FakeChar, cb: Callable) -> None:
+            await super().start_notify(char, cb)
+
+            async def stream() -> None:
+                while True:
+                    raw = (round(volts * 100) << 4) | 0x1
+                    msg = bytes([0xF5]) + raw.to_bytes(2, "big") + bytes([soc]) + b"\0" * 12
+                    self.notify("fff4", leagend.encrypt(msg, leagend.BM2_KEY))
+                    await asyncio.sleep(interval)
+
+            self.tasks.append(asyncio.get_running_loop().create_task(stream()))
+
+    return BM2Client("50:54:7B:00:00:B2", [svc], lambda *a: None)

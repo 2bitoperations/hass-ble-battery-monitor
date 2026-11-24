@@ -20,7 +20,7 @@ from custom_components.ble_battery_monitor.drivers.konnwei import (
 )
 from custom_components.ble_battery_monitor.drivers.leagend import LeagendDriver
 
-from .fakes import bm6_device, konnwei_device, konnwei_reply
+from .fakes import bm2_device, bm6_device, konnwei_device, konnwei_reply
 
 BK400_ADV = Advertisement(
     address="B4:00:00:00:12:34",
@@ -77,7 +77,14 @@ def test_detect():
         {76: bytes.fromhex("0215655f83caae16a10a702e31f30d58dd8200010002c5")},
         ["0000fff0-0000-1000-8000-00805f9b34fb"],
     )
-    assert detect(bm2) is None  # BM2 not implemented: must not be claimed
+    assert detect(bm2) == (LeagendDriver, "BM2")
+    # Generic FFF0 device with an unrelated name must not be claimed.
+    shield = Advertisement(
+        "AA:BB:CC:DD:EE:FF", "SHIELD Remote", {}, ["0000fff0-0000-1000-8000-00805f9b34fb"]
+    )
+    assert detect(shield) is None
+    # BM2 by name needs FFF0 too.
+    assert detect(Advertisement("AA:BB:CC:DD:EE:FF", "Battery Monitor", {}, [])) is None
 
 
 async def test_bk400_streaming_read():
@@ -126,3 +133,35 @@ async def test_bm6_timeout(monkeypatch):
     client.on_write = lambda *a: None
     with pytest.raises(DriverError, match="no real-time reply"):
         await LeagendDriver("BM6").async_read(client)
+
+
+def test_leagend_keys_and_published_samples():
+    assert (
+        bytes([108, 101, 97, 103, 101, 110, 100, 255, 254, 48, 49, 48, 48, 48, 48, 57])
+        == leagend.BM6_KEY
+    )
+    # haxrob: f54f414c... -> 12.68 V, 76 %;  KrystianD: F5508164... -> 12.88 V
+    r = leagend.parse_bm2(bytes.fromhex("f54f414c0b0f") + b"\0" * 10)
+    assert (r.voltage, r.soc) == (12.68, 76)
+    assert leagend.parse_bm2(bytes.fromhex("f550816400fa") + b"\0" * 10).voltage == 12.88
+    # per-block IV restart: two identical blocks encrypt identically
+    blk = bytes(range(16))
+    enc = leagend.encrypt(blk * 2, leagend.BM2_KEY)
+    assert enc[:16] == enc[16:] and leagend.decrypt(enc, leagend.BM2_KEY) == blk * 2
+
+
+async def test_bm2_streaming_read():
+    drv = LeagendDriver("BM2")
+    client = bm2_device(volts=12.68, soc=76)
+    r = await drv.async_read(client)
+    assert (r.voltage, r.soc, r.temperature) == (12.68, 76, None)
+    assert client.writes == []  # BM2 needs no commands
+    assert drv.sensors == frozenset({"voltage", "soc"})
+
+
+async def test_bm2_silent(monkeypatch):
+    monkeypatch.setattr(leagend, "BM2_STREAM_TIMEOUT", 0.3)
+    client = bm2_device(interval=10)
+    client.start_notify = lambda char, cb: __import__("asyncio").sleep(0)
+    with pytest.raises(DriverError, match="no BM2 reading"):
+        await LeagendDriver("BM2").async_read(client)

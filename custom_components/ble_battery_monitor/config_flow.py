@@ -14,7 +14,7 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlow,
 )
-from homeassistant.const import CONF_ADDRESS
+from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 import voluptuous as vol
@@ -77,10 +77,10 @@ class BatteryMonitorConfigFlow(ConfigFlow, domain=DOMAIN):
         address = self._discovery.address
         driver, model = self._found[address]
         if user_input is not None:
-            return self._create(address, driver, model)
-        self._set_confirm_only()
+            return self._create(address, driver, model, user_input.get(CONF_NAME))
         return self.async_show_form(
             step_id="bluetooth_confirm",
+            data_schema=vol.Schema({vol.Optional(CONF_NAME, default=_title(model, address)): str}),
             description_placeholders={"name": _title(model, address), "address": address},
         )
 
@@ -91,7 +91,7 @@ class BatteryMonitorConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(address, raise_on_progress=False)
             self._abort_if_unique_id_configured()
             driver, model = self._found[address]
-            return self._create(address, driver, model)
+            return self._create(address, driver, model, user_input.get(CONF_NAME))
 
         configured = self._async_current_ids(include_ignore=False)
         for info in async_discovered_service_info(self.hass, connectable=True):
@@ -111,15 +111,18 @@ class BatteryMonitorConfigFlow(ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_ADDRESS): selector.SelectSelector(
                         selector.SelectSelectorConfig(options=options)
-                    )
+                    ),
+                    vol.Optional(CONF_NAME): str,
                 }
             ),
         )
 
     @callback
-    def _create(self, address: str, driver: str, model: str) -> ConfigFlowResult:
+    def _create(
+        self, address: str, driver: str, model: str, name: str | None = None
+    ) -> ConfigFlowResult:
         return self.async_create_entry(
-            title=_title(model, address),
+            title=(name or "").strip() or _title(model, address),
             data={CONF_ADDRESS: address, CONF_DRIVER: driver, CONF_MODEL: model},
         )
 
