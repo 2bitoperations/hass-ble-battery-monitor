@@ -1,8 +1,9 @@
-"""Advertisement-triggered polling coordinator."""
+"""Polling coordinator: advertisement- and timer-triggered connect/read/disconnect."""
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 import logging
 import time
 
@@ -13,14 +14,16 @@ from homeassistant.components.bluetooth.active_update_coordinator import (
     ActiveBluetoothDataUpdateCoordinator,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CoreState, HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     CONF_POLL_INTERVAL,
     CONNECT_ATTEMPTS,
     DEFAULT_POLL_INTERVAL,
     POLL_TIMEOUT,
+    POLL_TIMER,
     RETRY_INTERVAL,
     STALE_INTERVALS,
     STALE_MIN,
@@ -31,10 +34,15 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
-    """Polls one monitor whenever it is heard and a poll is due.
+    """Polls one monitor when a poll is due and it has been heard since the last one.
 
     Each poll connects, reads, and disconnects, so the proxy's connection slot
     is only held for a few seconds.
+
+    HA only dispatches Bluetooth callbacks when advertisement *content* changes,
+    and these monitors advertise static data, so adverts alone would trigger one
+    poll and then nothing. A timer re-feeds HA's latest sighting (which is
+    refreshed on every advert) through the same path.
     """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, driver: Driver) -> None:
@@ -42,6 +50,7 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         self.driver = driver
         self.last_success: float | None = None  # wall clock of last good reading
         self.last_error: str | None = None
+        self._polling = False
         super().__init__(
             hass,
             _LOGGER,
@@ -65,10 +74,26 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         return time.time() - self.last_success < max_age
 
     @callback
+    def async_start_poll_timer(self) -> CALLBACK_TYPE:
+        """Start the periodic poll check; returns the cancel callback."""
+        return async_track_time_interval(
+            self.hass,
+            self._async_poll_timer,
+            timedelta(seconds=POLL_TIMER),
+            name=f"ble_battery_monitor poll {self.address}",
+        )
+
+    @callback
+    def _async_poll_timer(self, _now: datetime) -> None:
+        info = bluetooth.async_last_service_info(self.hass, self.address, connectable=True)
+        if info is not None:
+            self._async_handle_bluetooth_event(info, bluetooth.BluetoothChange.ADVERTISEMENT)
+
+    @callback
     def _needs_poll(
         self, service_info: bluetooth.BluetoothServiceInfoBleak, seconds_since_poll: float | None
     ) -> bool:
-        if self.hass.state is not CoreState.running:
+        if self.hass.state is not CoreState.running or self._polling:
             return False
         due = (
             self.poll_interval
@@ -85,6 +110,13 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         )
 
     async def _poll(self, service_info: bluetooth.BluetoothServiceInfoBleak) -> Reading:
+        self._polling = True
+        try:
+            return await self._poll_once(service_info)
+        finally:
+            self._polling = False
+
+    async def _poll_once(self, service_info: bluetooth.BluetoothServiceInfoBleak) -> Reading:
         ble_device = (
             bluetooth.async_ble_device_from_address(
                 self.hass, service_info.device.address, connectable=True

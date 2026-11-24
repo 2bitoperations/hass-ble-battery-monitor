@@ -16,6 +16,9 @@ MAX_POLL_INTERVAL: Final = 3600
 #: Retry sooner than the normal interval after a failed poll.
 RETRY_INTERVAL: Final = 60
 
+#: How often to check whether a poll is due (adverts alone aren't enough).
+POLL_TIMER: Final = 30
+
 #: Whole connect+read budget; a poll never blocks longer than this.
 POLL_TIMEOUT: Final = 45
 CONNECT_ATTEMPTS: Final = 3

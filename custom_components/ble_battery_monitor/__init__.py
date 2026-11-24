@@ -23,6 +23,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BatteryMonitorConfigEntr
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     # Start listening last, so entities exist before the first poll lands.
     entry.async_on_unload(coordinator.async_start())
+    entry.async_on_unload(coordinator.async_start_poll_timer())
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 

@@ -211,3 +211,57 @@ async def test_bm2_discovery_with_name_then_poll(hass: HomeAssistant) -> None:
     assert hass.states.get("sensor.tractor_voltage").state == "12.68"
     assert hass.states.get("sensor.tractor_state_of_charge").state == "76"
     assert hass.states.get("sensor.tractor_temperature") is None
+
+
+async def test_static_adverts_still_poll_via_timer(hass: HomeAssistant) -> None:
+    """Regression: HA skips callbacks for unchanged adverts; the timer must keep polling."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from custom_components.ble_battery_monitor.const import POLL_TIMER
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=BK400.address,
+        title="BK400 1234",
+        data={CONF_ADDRESS: BK400.address, CONF_DRIVER: "konnwei", CONF_MODEL: "BK400"},
+    )
+    entry.add_to_hass(hass)
+    connect = AsyncMock(side_effect=lambda *a, **k: _fake_bk400())
+    latest = {"info": BK400}
+    base = "custom_components.ble_battery_monitor.coordinator.bluetooth"
+    with (
+        patch(f"{base}.async_ble_device_from_address", return_value=BK400.device),
+        patch(f"{base}.async_last_service_info", side_effect=lambda *a, **k: latest["info"]),
+        patch("custom_components.ble_battery_monitor.coordinator.establish_connection", connect),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        coordinator = entry.runtime_data
+        coordinator._async_handle_bluetooth_event(BK400, BluetoothChange.ADVERTISEMENT)
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert connect.await_count == 1
+
+        # Device not heard since the last poll: timer must not poll.
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=POLL_TIMER + 1))
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert connect.await_count == 1
+
+        # Same advert content heard again an interval later: timer polls.
+        latest["info"] = service_info(
+            BK400.address, dict(BK400.manufacturer_data), list(BK400.service_uuids)
+        )
+        object.__setattr__(latest["info"], "time", time.monotonic() + coordinator.poll_interval + 5)
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=2 * POLL_TIMER + 2))
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert connect.await_count == 2
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def _fake_bk400():
+    client = konnwei_device()
+    client.disconnect = AsyncMock()
+    client.clear_cache = AsyncMock()
+    return client
