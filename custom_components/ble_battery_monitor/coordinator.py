@@ -19,8 +19,12 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
+    CONF_CHEMISTRY,
+    CONF_NOMINAL_VOLTAGE,
     CONF_POLL_INTERVAL,
     CONNECT_ATTEMPTS,
+    DEFAULT_CHEMISTRY,
+    DEFAULT_NOMINAL_VOLTAGE,
     DEFAULT_POLL_INTERVAL,
     POLL_TIMEOUT,
     POLL_TIMER,
@@ -29,6 +33,7 @@ from .const import (
     STALE_MIN,
 )
 from .drivers import CharacteristicMissing, Driver, DriverError, Reading
+from .soc import CHEM_NONE, estimate_soc
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +69,15 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
     @property
     def poll_interval(self) -> int:
         return int(self.entry.options.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
+
+    @property
+    def estimates_soc(self) -> bool:
+        """True if SoC is estimated from voltage (device doesn't report it)."""
+        return "soc" not in self.driver.sensors and self.chemistry != CHEM_NONE
+
+    @property
+    def chemistry(self) -> str:
+        return str(self.entry.options.get(CONF_CHEMISTRY, DEFAULT_CHEMISTRY))
 
     @property
     def has_fresh_data(self) -> bool:
@@ -149,6 +163,13 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         except Exception as err:
             self.last_error = f"{type(err).__name__}: {err}"
             raise
+        if self.estimates_soc:
+            reading.extra["soc_estimate"] = estimate_soc(
+                reading.voltage,
+                self.chemistry,
+                int(self.entry.options.get(CONF_NOMINAL_VOLTAGE, DEFAULT_NOMINAL_VOLTAGE)),
+                reading.temperature,
+            )
         self.last_success = time.time()
         self.last_error = None
         self._async_update_device_registry()

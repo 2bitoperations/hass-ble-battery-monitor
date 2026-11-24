@@ -72,6 +72,15 @@ READING_SENSORS: tuple[MonitorSensorDescription, ...] = (
     ),
 )
 
+SOC_ESTIMATE_SENSOR = MonitorSensorDescription(
+    key="soc_estimate",
+    translation_key="soc_estimate",
+    device_class=SensorDeviceClass.BATTERY,
+    native_unit_of_measurement=PERCENTAGE,
+    state_class=SensorStateClass.MEASUREMENT,
+    value_fn=lambda r: r.extra.get("soc_estimate"),
+)
+
 RSSI_SENSOR = SensorEntityDescription(
     key="rssi",
     device_class=SensorDeviceClass.SIGNAL_STRENGTH,
@@ -92,6 +101,8 @@ async def async_setup_entry(
     entities: list[SensorEntity] = [
         ReadingSensor(coordinator, d) for d in READING_SENSORS if d.key in supported
     ]
+    if coordinator.estimates_soc:
+        entities.append(ReadingSensor(coordinator, SOC_ESTIMATE_SENSOR))
     entities.append(RssiSensor(coordinator, RSSI_SENSOR))
     async_add_entities(entities)
 

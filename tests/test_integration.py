@@ -157,6 +157,8 @@ async def test_bk400_poll_creates_sensors(
     (device,) = dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)
     assert (device.model, device.sw_version, device.hw_version) == ("BK400", "V2.3", "V1.0")
     assert hass.states.get("sensor.bk400_1234_state_of_charge") is None  # BK400 doesn't report SoC
+    # ...so it's estimated (default flooded, 12 V): 12.65 V at 21.4 C -> 93 %
+    assert hass.states.get("sensor.bk400_1234_estimated_state_of_charge").state == "93"
     assert entity_registry.async_get("sensor.bk400_1234_signal_strength").disabled_by is not None
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -177,6 +179,7 @@ async def test_bm6_poll(hass: HomeAssistant) -> None:
     assert hass.states.get("sensor.bm6_00b6_voltage").state == "12.81"
     assert hass.states.get("sensor.bm6_00b6_state_of_charge").state == "87"
     assert hass.states.get("sensor.bm6_00b6_battery_state").state == "charging"
+    assert hass.states.get("sensor.bm6_00b6_estimated_state_of_charge") is None  # native SoC
 
 
 async def test_failed_poll_leaves_entities_unavailable(hass: HomeAssistant) -> None:
@@ -265,3 +268,62 @@ def _fake_bk400():
     client.disconnect = AsyncMock()
     client.clear_cache = AsyncMock()
     return client
+
+
+async def test_options_flow_over_http(hass: HomeAssistant, hass_client) -> None:
+    """Render and submit options through the HTTP API (catches schema-serialization 500s)."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=BK400.address,
+        title="BK400 1234",
+        data={CONF_ADDRESS: BK400.address, CONF_DRIVER: "konnwei", CONF_MODEL: "BK400"},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    from homeassistant.setup import async_setup_component
+
+    assert await async_setup_component(hass, "config", {})
+    client = await hass_client()
+    resp = await client.post(
+        "/api/config/config_entries/options/flow", json={"handler": entry.entry_id}
+    )
+    assert resp.status == 200, await resp.text()
+    form = await resp.json()
+    assert {f["name"] for f in form["data_schema"]} == {
+        "poll_interval",
+        "chemistry",
+        "nominal_voltage",
+    }
+    resp = await client.post(
+        f"/api/config/config_entries/options/flow/{form['flow_id']}",
+        json={"poll_interval": 300, "chemistry": "agm", "nominal_voltage": "12"},
+    )
+    assert resp.status == 200, await resp.text()
+    await hass.async_block_till_done()
+    assert entry.options == {"poll_interval": 300, "chemistry": "agm", "nominal_voltage": "12"}
+    assert entry.runtime_data.chemistry == "agm"
+    assert entry.runtime_data.poll_interval == 300
+
+
+async def test_options_flow_native_soc_has_no_battery_type(
+    hass: HomeAssistant, hass_client
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="50:54:7B:00:00:B2",
+        title="Tractor",
+        data={CONF_ADDRESS: "50:54:7B:00:00:B2", CONF_DRIVER: "leagend", CONF_MODEL: "BM2"},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    from homeassistant.setup import async_setup_component
+
+    assert await async_setup_component(hass, "config", {})
+    client = await hass_client()
+    resp = await client.post(
+        "/api/config/config_entries/options/flow", json={"handler": entry.entry_id}
+    )
+    assert resp.status == 200, await resp.text()
+    assert [f["name"] for f in (await resp.json())["data_schema"]] == ["poll_interval"]

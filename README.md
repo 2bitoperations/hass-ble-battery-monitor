@@ -5,10 +5,10 @@ Bluetooth stack so it works through ESPHome Bluetooth proxies.
 
 | Family | Models | Status | Readings |
 |---|---|---|---|
-| KONNWEI | BK400 | tested in simulation, live test pending | voltage, temperature |
+| KONNWEI | BK400 | live-tested | voltage, temperature, estimated SoC |
 | KONNWEI | BK300 | untested (same framing, uses the `0B0B` voltage poll) | voltage, temperature if supported |
 | Leagend | BM6 | tested in simulation, live test pending | voltage, temperature, state of charge, state |
-| Leagend | BM2 ("Battery Monitor", ZX-1689) | tested in simulation, live test pending | voltage, state of charge |
+| Leagend | BM2 ("Battery Monitor", ZX-1689) | live-tested | voltage, state of charge (no temperature sensor) |
 | Leagend | BM7 | not yet | |
 
 ## How it works
@@ -51,3 +51,11 @@ uvx ruff check . && uvx ruff format --check .
 Drivers (`drivers/`) don't import Home Assistant, and are tested against simulated devices in
 `tests/fakes.py`. To add a family: subclass `drivers.base.Driver` (`detect()` + `async_read()`),
 register it in `drivers/__init__.py`, and add a manifest matcher.
+
+## Estimated state of charge
+
+Monitors that don't report SoC (KONNWEI BK series) get an **Estimated state of charge** sensor, worked out
+from resting voltage. Set the battery type (flooded / AGM / gel / LiFePO4 / none) and the nominal voltage
+(6–48 V) in Options. It's only accurate after the battery has rested for a few hours: it reads high while
+charging and low under load. LiFePO4's flat voltage curve makes it a coarse guide only. A small lead-acid
+temperature term (+1.2 mV/°C at 12 V, about 1 % per 10 °C) is applied when the monitor reports temperature.

@@ -9,6 +9,11 @@ DOMAIN: Final = "ble_battery_monitor"
 CONF_DRIVER: Final = "driver"
 CONF_MODEL: Final = "model"
 CONF_POLL_INTERVAL: Final = "poll_interval"
+CONF_CHEMISTRY: Final = "chemistry"
+CONF_NOMINAL_VOLTAGE: Final = "nominal_voltage"
+
+DEFAULT_CHEMISTRY: Final = "flooded"
+DEFAULT_NOMINAL_VOLTAGE: Final = 12
 
 DEFAULT_POLL_INTERVAL: Final = 120  # seconds
 MIN_POLL_INTERVAL: Final = 30

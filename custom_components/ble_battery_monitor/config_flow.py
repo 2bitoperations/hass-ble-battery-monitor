@@ -20,15 +20,20 @@ from homeassistant.helpers import selector
 import voluptuous as vol
 
 from .const import (
+    CONF_CHEMISTRY,
     CONF_DRIVER,
     CONF_MODEL,
+    CONF_NOMINAL_VOLTAGE,
     CONF_POLL_INTERVAL,
+    DEFAULT_CHEMISTRY,
+    DEFAULT_NOMINAL_VOLTAGE,
     DEFAULT_POLL_INTERVAL,
     DOMAIN,
     MAX_POLL_INTERVAL,
     MIN_POLL_INTERVAL,
 )
-from .drivers import Advertisement, detect
+from .drivers import DRIVERS, Advertisement, detect
+from .soc import CHEMISTRIES, NOMINAL_VOLTAGES
 
 
 def _detect(info: BluetoothServiceInfoBleak) -> tuple[str, str] | None:
@@ -133,28 +138,44 @@ class BatteryMonitorConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class BatteryMonitorOptionsFlow(OptionsFlow):
-    """Poll interval."""
+    """Poll interval, plus battery type for monitors without native SoC."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
             return self.async_create_entry(data=user_input)
-        current = self.config_entry.options.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_POLL_INTERVAL, default=current): vol.All(
-                        selector.NumberSelector(
-                            selector.NumberSelectorConfig(
-                                min=MIN_POLL_INTERVAL,
-                                max=MAX_POLL_INTERVAL,
-                                step=10,
-                                unit_of_measurement="s",
-                                mode=selector.NumberSelectorMode.BOX,
-                            )
-                        ),
-                        vol.Coerce(int),
-                    )
-                }
-            ),
-        )
+        opts = self.config_entry.options
+        data = self.config_entry.data
+        native_soc = "soc" in DRIVERS[data[CONF_DRIVER]](data[CONF_MODEL]).sensors
+        schema: dict[Any, Any] = {
+            vol.Required(
+                CONF_POLL_INTERVAL, default=opts.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=MIN_POLL_INTERVAL,
+                    max=MAX_POLL_INTERVAL,
+                    step=10,
+                    unit_of_measurement="s",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+        }
+        if not native_soc:
+            schema[
+                vol.Required(CONF_CHEMISTRY, default=opts.get(CONF_CHEMISTRY, DEFAULT_CHEMISTRY))
+            ] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=list(CHEMISTRIES), translation_key=CONF_CHEMISTRY
+                )
+            )
+            schema[
+                vol.Required(
+                    CONF_NOMINAL_VOLTAGE,
+                    default=str(opts.get(CONF_NOMINAL_VOLTAGE, DEFAULT_NOMINAL_VOLTAGE)),
+                )
+            ] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[str(v) for v in NOMINAL_VOLTAGES],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))
