@@ -34,12 +34,14 @@
         "data": {
           "poll_interval": "Poll interval",
           "chemistry": "Battery type",
-          "nominal_voltage": "Nominal battery voltage"
+          "nominal_voltage": "Nominal battery voltage",
+          "history": "Backfill from the device's log"
         },
         "data_description": {
           "poll_interval": "How often to connect and read the monitor. Each poll connects for a few seconds, then disconnects.",
           "chemistry": "Used to estimate state of charge from resting voltage (this monitor doesn't report it). Choose None to hide the estimate.",
-          "nominal_voltage": "6, 12, 24, 36 or 48 V system."
+          "nominal_voltage": "6, 12, 24, 36 or 48 V system.",
+          "history": "After the monitor has been out of range (or Home Assistant was down), download its own log and fill the missing hours into long-term statistics."
         }
       }
     }
@@ -61,6 +63,11 @@
       "soc_estimate": {
         "name": "Estimated state of charge"
       }
+    },
+    "button": {
+      "fetch_history": {
+        "name": "Fetch history"
+      }
     }
   },
   "selector": {
@@ -71,6 +78,26 @@
         "gel": "Gel",
         "lifepo4": "LiFePO4 (coarse)",
         "none": "None (no estimate)"
+      }
+    }
+  },
+  "services": {
+    "konnwei_command": {
+      "name": "Send KONNWEI command",
+      "description": "Protocol research: connect to a KONNWEI monitor, send allow-listed commands (status, time sync, LED and data logging only) and return the raw replies.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The KONNWEI monitor."
+        },
+        "commands": {
+          "name": "Commands",
+          "description": "List of \"CMD\" or \"CMD:PAYLOADHEX\", e.g. [\"0B09\", \"0B03\"]."
+        },
+        "listen": {
+          "name": "Listen time",
+          "description": "How long to collect replies after each command."
+        }
       }
     }
   }

@@ -116,9 +116,20 @@ def konnwei_device(
     return FakeClient("B4:00:00:00:12:34", [svc], on_write)
 
 
+def _blocks(data: bytes) -> list[bytes]:
+    data = data.ljust(-(-len(data) // 16) * 16, b"\0")
+    return [data[i : i + 16] for i in range(0, len(data), 16)]
+
+
 def bm6_device(
-    *, volts: float = 12.81, temp: int = -5, soc: int = 87, state: int = 2
+    *,
+    volts: float = 12.81,
+    temp: int = -5,
+    soc: int = 87,
+    state: int = 2,
+    history: list[tuple[float, int, int]] | None = None,
 ) -> FakeClient:
+    """history: (volts, soc, temp) records, newest first."""
     svc = FakeService(
         uuid16("fff0"),
         [FakeChar(uuid16("fff3"), ["write"]), FakeChar(uuid16("fff4"), ["notify"])],
@@ -134,12 +145,53 @@ def bm6_device(
                 + b"\0" * 7
             )
             client.notify("fff4", leagend.encrypt(msg))
+        elif req[:3] == bytes.fromhex("d15505") and history is not None:
+            pages = req[7]
+            recs = history[: pages * 256]
+            data = b"".join(
+                ((round(v * 100) << 20) | (s << 12) | (t << 4)).to_bytes(4, "big")
+                for v, s, t in recs
+            )
+            data += bytes(4 * 3)  # empty slots
+            out = [bytes.fromhex("d1550501") + bytes(12), *_blocks(data)]
+            out.append(b"\xff\xfe\xfe" + (len(data) + 9).to_bytes(3, "big") + bytes(10))
+            # Several blocks per notification, like a large MTU.
+            for i in range(0, len(out), 4):
+                client.notify("fff4", b"".join(leagend.encrypt(b) for b in out[i : i + 4]))
 
     return FakeClient("50:54:7B:00:00:B6", [svc], on_write)
 
 
-def bm2_device(*, volts: float = 12.68, soc: int = 76, interval: float = 0.2) -> FakeClient:
-    """BM2: streams F5 packets once notifications are on; writes nothing."""
+def bm2_device(
+    *,
+    volts: float = 12.68,
+    soc: int = 76,
+    interval: float = 0.2,
+    history: list[float] | None = None,
+) -> FakeClient:
+    """BM2: streams F5 packets once notifications are on.
+
+    history: logged voltages, oldest first (E7/E3 download); None = ignores writes.
+    """
+    key = leagend.BM2_KEY
+
+    def on_write(client: FakeClient, _char: FakeChar, data: bytes) -> None:
+        req = leagend.decrypt(data, key)
+        if history is None:
+            return
+        recs = b"".join(
+            ((round(v * 100) << 20) | (0x1 << 16) | (0x2BC << 4) | 0x1).to_bytes(4, "big")
+            for v in history
+        )
+        if req[:2] == b"\xe7\x01":
+            client.notify("fff4", leagend.encrypt(b"\xe7" + len(recs).to_bytes(3, "big"), key))
+        elif req[:3] == b"\xe3\x00\x00":
+            assert int.from_bytes(req[3:7], "big") == len(recs)
+            out = [b"\xff\xff\xfe", *_blocks(recs)]
+            out.append(b"\xff\xfe\xfe" + (len(recs) + 9).to_bytes(3, "big"))
+            for block in out:
+                client.notify("fff4", leagend.encrypt(block, key))
+
     svc = FakeService(
         uuid16("fff0"),
         [FakeChar(uuid16("fff3"), ["write"]), FakeChar(uuid16("fff4"), ["notify"])],
@@ -158,4 +210,4 @@ def bm2_device(*, volts: float = 12.68, soc: int = 76, interval: float = 0.2) ->
 
             self.tasks.append(asyncio.get_running_loop().create_task(stream()))
 
-    return BM2Client("50:54:7B:00:00:B2", [svc], lambda *a: None)
+    return BM2Client("50:54:7B:00:00:B2", [svc], on_write)

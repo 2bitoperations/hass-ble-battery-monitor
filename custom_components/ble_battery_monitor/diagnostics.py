@@ -24,6 +24,13 @@ async def async_get_config_entry_diagnostics(
         "last_success": coordinator.last_success,
         "last_poll_successful": coordinator.last_poll_successful,
         "last_error": coordinator.last_error,
+        "history": {
+            "enabled": coordinator.history_enabled,
+            "pending_since": coordinator._history_since,
+            "last_attempt": coordinator._history_attempt,
+            "status": coordinator.history_status,
+            "download": driver.history_info,
+        },
         "advertisement": None
         if info is None
         else {

@@ -22,10 +22,12 @@ import voluptuous as vol
 from .const import (
     CONF_CHEMISTRY,
     CONF_DRIVER,
+    CONF_HISTORY,
     CONF_MODEL,
     CONF_NOMINAL_VOLTAGE,
     CONF_POLL_INTERVAL,
     DEFAULT_CHEMISTRY,
+    DEFAULT_HISTORY,
     DEFAULT_NOMINAL_VOLTAGE,
     DEFAULT_POLL_INTERVAL,
     DOMAIN,
@@ -145,7 +147,8 @@ class BatteryMonitorOptionsFlow(OptionsFlow):
             return self.async_create_entry(data=user_input)
         opts = self.config_entry.options
         data = self.config_entry.data
-        native_soc = "soc" in DRIVERS[data[CONF_DRIVER]](data[CONF_MODEL]).sensors
+        driver = DRIVERS[data[CONF_DRIVER]](data[CONF_MODEL])
+        native_soc = "soc" in driver.sensors
         schema: dict[Any, Any] = {
             vol.Required(
                 CONF_POLL_INTERVAL, default=opts.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
@@ -159,6 +162,10 @@ class BatteryMonitorOptionsFlow(OptionsFlow):
                 )
             )
         }
+        if driver.supports_history:
+            schema[vol.Required(CONF_HISTORY, default=opts.get(CONF_HISTORY, DEFAULT_HISTORY))] = (
+                selector.BooleanSelector()
+            )
         if not native_soc:
             schema[
                 vol.Required(CONF_CHEMISTRY, default=opts.get(CONF_CHEMISTRY, DEFAULT_CHEMISTRY))

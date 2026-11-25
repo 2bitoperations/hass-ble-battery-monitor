@@ -165,3 +165,76 @@ async def test_bm2_silent(monkeypatch):
     client.start_notify = lambda char, cb: __import__("asyncio").sleep(0)
     with pytest.raises(DriverError, match="no BM2 reading"):
         await LeagendDriver("BM2").async_read(client)
+
+
+# --- history (device log) ---------------------------------------------------
+
+
+def test_bm2_history_record_matches_published_vector():
+    # KrystianD bit_utils docstring: 4d411111 -> 1236 (12.36 V), k=1, 273, p=1
+    (s,) = leagend.parse_bm2_history(bytes.fromhex("4d411111"), newest_ts=1000.0)
+    assert (s.ts, s.voltage, s.soc, s.temperature) == (1000.0, 12.36, None, None)
+
+
+def test_bm2_history_oldest_first_two_minute_steps():
+    data = bytes.fromhex("4d411111") * 3
+    ts = [s.ts for s in leagend.parse_bm2_history(data + b"\x00", newest_ts=10_000.0)]
+    assert ts == [10_000.0 - 240, 10_000.0 - 120, 10_000.0]
+
+
+def test_bm6_history_matches_published_vector():
+    # bmgateway test: 52b4c170 -> 13.23 V, SoC 76, 23 C; newest first; zero slots skipped
+    data = bytes.fromhex("52b4c17052b4d16000000000")
+    newest, older = reversed(leagend.parse_bm6_history(data, newest_ts=5000.0))
+    assert (newest.ts, newest.voltage, newest.soc, newest.temperature) == (5000.0, 13.23, 76, 23.0)
+    assert (older.ts, older.voltage, older.soc, older.temperature) == (4880.0, 13.23, 77, 22.0)
+
+
+def test_bm6_history_request():
+    assert leagend.bm6_history_request(3) == bytes.fromhex("d1550500000000030000000000000000")
+    with pytest.raises(ValueError):
+        leagend.bm6_history_request(0)
+
+
+@pytest.fixture
+def fast_history(monkeypatch):
+    monkeypatch.setattr(leagend, "BM2_HISTORY_PAUSE", 0.0)
+    monkeypatch.setattr(leagend, "HISTORY_IDLE", 0.4)
+
+
+async def test_bm2_history_download(fast_history):
+    volts = [round(12.40 + i / 100, 2) for i in range(40)]  # 40 records = 10 data blocks
+    drv = LeagendDriver("BM2")
+    assert drv.supports_history
+    client = bm2_device(history=volts, interval=0.01)  # live packets interleave
+    samples = await drv.async_read_history(client, since=0)
+    assert [s.voltage for s in samples] == volts
+    assert samples[-1].ts - samples[0].ts == 39 * 120
+    assert drv.history_info["records"] == 40
+
+
+async def test_bm2_history_empty(fast_history):
+    assert await LeagendDriver("BM2").async_read_history(bm2_device(history=[]), since=0) == []
+
+
+async def test_bm2_history_unanswered_fails_fast(fast_history):
+    with pytest.raises(DriverError, match="history download timed out"):
+        await LeagendDriver("BM2").async_read_history(bm2_device(history=None), since=0)
+
+
+async def test_bm6_history_download(fast_history):
+    import time
+
+    recs = [(12.70 - i / 100, max(0, 90 - i), 20) for i in range(300)]  # newest first, > 1 page
+    drv = LeagendDriver("BM6")
+    client = bm6_device(history=recs)
+    samples = await drv.async_read_history(client, since=time.time() - 3600)
+    assert len(samples) == 256  # one page covers the last hour
+    assert samples[-1].voltage == 12.70 and samples[-1].soc == 90
+    assert samples[0].voltage == round(12.70 - 2.55, 2)
+    samples = await drv.async_read_history(client, since=time.time() - 12 * 3600)
+    assert len(samples) == 300  # two pages requested
+
+
+def test_konnwei_has_no_history_yet():
+    assert not KonnweiDriver("BK400").supports_history

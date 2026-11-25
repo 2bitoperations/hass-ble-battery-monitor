@@ -1,0 +1,20 @@
+konnwei_command:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: ble_battery_monitor
+    commands:
+      required: true
+      example: '["0B09", "0B03"]'
+      selector:
+        object:
+    listen:
+      default: 2
+      selector:
+        number:
+          min: 0.2
+          max: 30
+          step: 0.1
+          unit_of_measurement: s

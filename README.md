@@ -3,12 +3,12 @@
 One integration for cheap Bluetooth 12 V battery monitors, built on Home Assistant's
 Bluetooth stack so it works through ESPHome Bluetooth proxies.
 
-| Family | Models | Status | Readings |
-|---|---|---|---|
-| KONNWEI | BK400 | live-tested | voltage, temperature, estimated SoC |
-| KONNWEI | BK300 | untested (same framing, uses the `0B0B` voltage poll) | voltage, temperature if supported |
-| Leagend | BM6 | tested in simulation, live test pending | voltage, temperature, state of charge, state |
-| Leagend | BM2 ("Battery Monitor", ZX-1689) | live-tested | voltage, state of charge (no temperature sensor) |
+| Family | Models | Status | Readings | History backfill |
+|---|---|---|---|---|
+| KONNWEI | BK400 | live-tested | voltage, temperature, estimated SoC | not yet (needs on-device logging schedules) |
+| KONNWEI | BK300 | untested (same framing, uses the `0B0B` voltage poll) | voltage, temperature if supported | no |
+| Leagend | BM6 | tested in simulation, live test pending | voltage, temperature, state of charge, state | voltage, SoC, temperature (~48 h) |
+| Leagend | BM2 ("Battery Monitor", ZX-1689) | live-tested | voltage, state of charge (no temperature sensor) | voltage |
 | Leagend | BM7 | not yet | |
 
 ## How it works
@@ -27,11 +27,31 @@ Bluetooth stack so it works through ESPHome Bluetooth proxies.
   15 min), then goes unavailable. Errors are logged once per outage, not every minute.
 - **Diagnostics:** the download includes the last reading, the poll error and the last ~60 raw BLE frames.
 
+### History backfill
+
+BM2 and BM6 monitors keep their own log (one record every 2 minutes). When a monitor comes back
+after being out of range (or after Home Assistant was down), the next poll also downloads that log and
+imports the missing hours into the sensors' **long-term statistics** (hourly mean/min/max).
+
+- Only hours with no statistics yet are filled, so live data is never overwritten.
+- Home Assistant can't add states to the past, so a backfilled gap shows in a **Statistics graph** card
+  (and in history graphs before the first recorded state), not as states in the history graph.
+- Leagend records carry no timestamps; they're dated back from the newest one in 2-minute steps.
+- Turn it off in Options, or press the **Fetch history** button to backfill on demand (up to 7 days,
+  limited by what the device keeps).
+
 ### Safety
 
-Drivers only send what the vendor apps send on every connect. They never send firmware-update,
+Drivers only send what the vendor apps send on every connect (plus the history download the apps use).
+They never send firmware-update,
 data-delete, rename or factory/calibration commands. On a KONNWEI device that reports firmware-update
 mode, the driver stops after the first query.
+
+### Research service
+
+`ble_battery_monitor.konnwei_command` connects to a KONNWEI monitor, sends a list of commands
+(`"0B09"`, `"0B02:<payload hex>"`, ...) and returns the raw notifications. Only status, info, time-sync,
+LED and data-logging commands are accepted; firmware, delete, rename and factory commands are refused.
 
 ## Install
 

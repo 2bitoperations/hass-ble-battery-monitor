@@ -18,7 +18,7 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ble_battery_monitor.const import CONF_DRIVER, CONF_MODEL, DOMAIN
-from custom_components.ble_battery_monitor.drivers import konnwei
+from custom_components.ble_battery_monitor.drivers import konnwei, leagend
 
 from .fakes import bm2_device, bm6_device, konnwei_device
 
@@ -68,6 +68,8 @@ def _bt(mock_bluetooth, monkeypatch):
     monkeypatch.setattr(konnwei, "REPLY_TIMEOUT", 0.3)
     monkeypatch.setattr(konnwei, "STREAM_WAIT", 0.6)
     monkeypatch.setattr(konnwei, "STREAM_COLLECT", 0.3)
+    monkeypatch.setattr(leagend, "HISTORY_IDLE", 0.3)
+    monkeypatch.setattr(leagend, "BM2_HISTORY_PAUSE", 0.0)
 
 
 async def test_bluetooth_discovery_creates_entry(hass: HomeAssistant) -> None:
@@ -324,4 +326,45 @@ async def test_options_flow_native_soc_has_no_battery_type(
         "/api/config/config_entries/options/flow", json={"handler": entry.entry_id}
     )
     assert resp.status == 200, await resp.text()
-    assert [f["name"] for f in (await resp.json())["data_schema"]] == ["poll_interval"]
+    # Native SoC: no battery type. BM2 logs history: the backfill switch.
+    assert [f["name"] for f in (await resp.json())["data_schema"]] == ["poll_interval", "history"]
+
+
+async def test_konnwei_command_service(hass: HomeAssistant) -> None:
+    from homeassistant.exceptions import ServiceValidationError
+    from homeassistant.helpers import device_registry as dr
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=BK400.address,
+        title="BK400 1234",
+        data={CONF_ADDRESS: BK400.address, CONF_DRIVER: "konnwei", CONF_MODEL: "BK400"},
+    )
+    await _setup_and_poll(hass, entry, BK400, konnwei_device())
+    (device,) = dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)
+    fake = konnwei_device(temp=19.5)
+    fake.disconnect = AsyncMock()
+    base = "custom_components.ble_battery_monitor.coordinator"
+    with (
+        patch(f"{base}.bluetooth.async_ble_device_from_address", return_value=BK400.device),
+        patch(f"{base}.establish_connection", AsyncMock(return_value=fake)),
+    ):
+        resp = await hass.services.async_call(
+            DOMAIN,
+            "konnwei_command",
+            {"device_id": device.id, "commands": ["0B0C"], "listen": 0.3},
+            blocking=True,
+            return_response=True,
+        )
+        assert resp["tx"][0]["hex"] == "40400a000b0c16c60d0a"
+        assert resp["frames"] == [{"cmd": "4B0C", "payload": "9e07", "crc_ok": True}]
+        fake.disconnect.assert_awaited()
+        for bad in ("0A03", "0302", "0C02:00", "zz"):
+            with pytest.raises(ServiceValidationError):
+                await hass.services.async_call(
+                    DOMAIN,
+                    "konnwei_command",
+                    {"device_id": device.id, "commands": [bad]},
+                    blocking=True,
+                    return_response=True,
+                )

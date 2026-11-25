@@ -32,3 +32,14 @@ CONNECT_ATTEMPTS: Final = 3
 #: (at least STALE_MIN seconds) before going unavailable.
 STALE_INTERVALS: Final = 3
 STALE_MIN: Final = 900
+
+CONF_HISTORY: Final = "history"
+DEFAULT_HISTORY: Final = True
+#: A gap this long between good readings triggers a history download (backfill).
+HISTORY_GAP: Final = 600
+#: How far back to backfill after a restart or a manual request.
+HISTORY_MAX_AGE: Final = 7 * 86400
+#: After a failed history download, wait this long before trying again.
+HISTORY_RETRY: Final = 1800
+#: Budget for one history download (on top of the normal poll).
+HISTORY_TIMEOUT: Final = 150

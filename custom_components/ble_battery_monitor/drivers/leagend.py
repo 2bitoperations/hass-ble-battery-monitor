@@ -14,6 +14,19 @@ BM2: streams after subscribing, no request. Reading packet (decrypted):
   [3] charge level % (per haxrob; KrystianD doesn't decode it)
   Other packet types (E7 history count, FF FF FE / FF FE FE history markers) are ignored.
 
+History (the device's own log, one record every 2 minutes, no timestamps):
+  BM2 (KrystianD/bm2-battery-monitor): write E7 01 -> E7 + u24 BE size;
+    wait 1 s, write E3 00 00 + u32 BE size -> FF FF FE (start), data blocks,
+    FF FE FE + u24 BE (framed size; data = size - 9). Records are 4 bytes,
+    oldest first, nibbles "xxxkyyyp": xxx centivolts, k status, yyy lowest
+    cranking centivolts, p event type.
+  BM6 (marcomc/bmgateway, verified on hardware there): write
+    d1 55 05 00 00 00 00 NN 00.. (NN = number of 256-record pages, cumulative)
+    -> d15505 header, data blocks, FF FE FE trailer. Records are 4 bytes,
+    newest first: 12 bits centivolts, 8 bits SoC %, 8 bits temperature C,
+    4 bits event type; all-zero records are empty slots. Deeper page counts
+    saturate around 48 h of records.
+
 BM7 uses yet another key/layout; not implemented.
 """
 
@@ -22,12 +35,14 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import logging
+import math
+import time
 from typing import TYPE_CHECKING
 
 from bleak.exc import BleakError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from .base import Advertisement, Driver, DriverError, Reading, find_char
+from .base import Advertisement, Driver, DriverError, HistorySample, Reading, find_char
 
 if TYPE_CHECKING:
     from bleak import BleakClient
@@ -49,6 +64,20 @@ REPLY_TIMEOUT = 10.0
 BM2_STREAM_TIMEOUT = 20.0
 BM2_READING = 0xF5
 
+HISTORY_INTERVAL = 120  # seconds between logged records (BM2 and BM6)
+HISTORY_START = b"\xff\xff\xfe"
+HISTORY_END = b"\xff\xfe\xfe"
+BM2_HISTORY_COUNT = bytes([0xE7, 0x01])
+BM2_HISTORY_DOWNLOAD = bytes([0xE3, 0x00, 0x00])
+#: KrystianD: "required, otherwise BM2 ignores the following packet".
+BM2_HISTORY_PAUSE = 1.0
+BM6_HISTORY_REPLY = bytes.fromhex("d15505")
+BM6_PAGE_RECORDS = 256
+BM6_MAX_PAGES = 6  # ~51 h; deeper selectors return the same ~48 h window
+#: Whole history download budget, and the longest silence allowed inside it.
+HISTORY_TIMEOUT = 90.0
+HISTORY_IDLE = 5.0
+
 # iBeacon (Apple, company 76) UUIDs, and other manufacturer-data prefixes seen on
 # BM6 variants (from the BM6 integration's matchers).
 BM6_IBEACON_PREFIX = bytes.fromhex("02153ba29cd9a42c894856badaf2606ef777")
@@ -65,6 +94,7 @@ BM2_NAMES = {"BATTERY MONITOR", "LI BATTERY MONITOR", "ZX-1689"}
 STATES = {0: "ok", 1: "low_voltage", 2: "charging"}
 
 MODEL_KEYS = {"BM6": BM6_KEY, "BM2": BM2_KEY}
+HISTORY_MODELS = {"BM6", "BM2"}
 MODEL_SENSORS = {
     "BM6": frozenset({"voltage", "temperature", "soc", "state"}),
     "BM2": frozenset({"voltage", "soc"}),
@@ -126,6 +156,67 @@ def parse_bm2(msg: bytes) -> Reading:
     )
 
 
+def _u24(b: bytes) -> int:
+    return int.from_bytes(b[:3], "big")
+
+
+def bm6_history_request(pages: int) -> bytes:
+    """d15505 with byte 7 = cumulative number of 256-record pages."""
+    if not 1 <= pages <= 255:
+        raise ValueError("pages must be 1..255")
+    return bytes([0xD1, 0x55, 0x05, 0, 0, 0, 0, pages]) + bytes(8)
+
+
+def bm2_history_download(size: int) -> bytes:
+    return BM2_HISTORY_DOWNLOAD + size.to_bytes(4, "big")
+
+
+def _plausible_volts(v: float) -> float | None:
+    return v if 0.0 < v <= 40.0 else None
+
+
+def parse_bm2_history(data: bytes, newest_ts: float) -> list[HistorySample]:
+    """BM2 history records (oldest first), timestamped back from newest_ts."""
+    records = [data[i : i + 4] for i in range(0, len(data) - len(data) % 4, 4)]
+    n = len(records)
+    out = []
+    for i, rec in enumerate(records):
+        volts = (int.from_bytes(rec[0:2], "big") >> 4) / 100
+        out.append(
+            HistorySample(
+                ts=newest_ts - (n - 1 - i) * HISTORY_INTERVAL,
+                voltage=_plausible_volts(round(volts, 2)),
+            )
+        )
+    return out
+
+
+def parse_bm6_history(data: bytes, newest_ts: float) -> list[HistorySample]:
+    """BM6 history records (newest first); empty (all-zero) slots are skipped."""
+    out = []
+    index = 0
+    for i in range(0, len(data) - len(data) % 4, 4):
+        rec = data[i : i + 4]
+        if rec == bytes(4):
+            continue
+        word = int.from_bytes(rec, "big")
+        volts = (word >> 20) / 100
+        soc = (word >> 12) & 0xFF
+        temp = (word >> 4) & 0xFF
+        out.append(
+            HistorySample(
+                ts=newest_ts - index * HISTORY_INTERVAL,
+                voltage=_plausible_volts(round(volts, 2)),
+                soc=soc if soc <= 100 else None,
+                # Unsigned in the record; the sign encoding (if any) is unknown.
+                temperature=float(temp) if temp <= 100 else None,
+            )
+        )
+        index += 1
+    out.reverse()
+    return out
+
+
 class LeagendDriver(Driver):
     """Leagend BM6 / BM2."""
 
@@ -139,6 +230,7 @@ class LeagendDriver(Driver):
             raise ValueError(f"unsupported Leagend model {model}")
         self._key = MODEL_KEYS[model]
         self.sensors = MODEL_SENSORS[model]
+        self.supports_history = model in HISTORY_MODELS
 
     @classmethod
     def detect(cls, adv: Advertisement) -> str | None:
@@ -218,3 +310,97 @@ class LeagendDriver(Driver):
             with suppress(BleakError, EOFError):
                 await client.stop_notify(notify_char)
         return parse_bm2(msg)
+
+    async def async_read_history(self, client: BleakClient, since: float) -> list[HistorySample]:
+        notify_char = find_char(client, SERVICE, want="notify", prefer=NOTIFY)
+        write_char = find_char(client, SERVICE, want="write", prefer=WRITE)
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        data_blocks = 0
+        is_bm2 = self.details.model == "BM2"
+
+        def on_notify(_char: object, data: bytearray) -> None:
+            nonlocal data_blocks
+            raw = bytes(data)
+            if len(raw) < 16 or len(raw) % 16:
+                self._trace("rx?", raw)
+                return
+            for i in range(0, len(raw), 16):
+                block = decrypt(raw[i : i + 16], self._key)
+                if block[0] == BM2_READING and is_bm2:
+                    continue  # BM2 keeps streaming live readings; not part of the log
+                # Keep the trace readable: markers and replies, not every data block.
+                if block[:3] in (HISTORY_START, HISTORY_END, BM6_HISTORY_REPLY) or block[0] == 0xE7:
+                    self._trace("rx", block)
+                else:
+                    data_blocks += 1
+                queue.put_nowait(block)
+
+        async def write(msg: bytes) -> None:
+            self._trace("tx", msg)
+            await client.write_gatt_char(write_char, encrypt(msg, self._key), response=True)
+
+        async def next_block() -> bytes:
+            async with asyncio.timeout(HISTORY_IDLE):
+                return await queue.get()
+
+        await client.start_notify(notify_char, on_notify)
+        try:
+            async with asyncio.timeout(HISTORY_TIMEOUT):
+                if is_bm2:
+                    data = await self._bm2_history(write, next_block)
+                    samples = parse_bm2_history(data, time.time())
+                else:
+                    pages = math.ceil((time.time() - since) / (BM6_PAGE_RECORDS * HISTORY_INTERVAL))
+                    data = await self._bm6_history(
+                        write, next_block, max(1, min(BM6_MAX_PAGES, pages))
+                    )
+                    samples = parse_bm6_history(data, time.time())
+        except TimeoutError as err:
+            raise DriverError(f"history download timed out ({data_blocks} data blocks)") from err
+        finally:
+            with suppress(BleakError, EOFError):
+                await client.stop_notify(notify_char)
+        self.history_info = {
+            "bytes": len(data),
+            "records": len(samples),
+            "data_blocks": data_blocks,
+            "at": round(time.time()),
+        }
+        return samples
+
+    @staticmethod
+    async def _bm2_history(write, next_block) -> bytes:
+        await write(BM2_HISTORY_COUNT)
+        while (block := await next_block())[0] != 0xE7:
+            pass
+        size = _u24(block[1:4])
+        if size == 0:
+            return b""
+        await asyncio.sleep(BM2_HISTORY_PAUSE)
+        await write(bm2_history_download(size))
+        while not (block := await next_block()).startswith(HISTORY_START):
+            pass
+        buf = bytearray()
+        while True:
+            block = await next_block()
+            if block.startswith(HISTORY_END):
+                return bytes(buf[: max(0, _u24(block[3:6]) - 9)])
+            buf += block
+
+    @staticmethod
+    async def _bm6_history(write, next_block, pages: int) -> bytes:
+        await write(bm6_history_request(pages))
+        buf = bytearray()
+        seen = False
+        while True:
+            block = await next_block()
+            if block.startswith(BM6_HISTORY_REPLY) or block.startswith(HISTORY_START):
+                seen = True
+                continue
+            if block.startswith(REPLY_REALTIME) or not seen:
+                continue
+            end = block.find(HISTORY_END)
+            if end >= 0:
+                buf += block[:end]
+                return bytes(buf)
+            buf += block

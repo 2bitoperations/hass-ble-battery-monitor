@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from .base import Advertisement, CharacteristicMissing, Driver, DriverError, Reading
+from .base import (
+    Advertisement,
+    CharacteristicMissing,
+    Driver,
+    DriverError,
+    HistorySample,
+    Reading,
+)
 from .konnwei import KonnweiDriver
 from .leagend import LeagendDriver
 
@@ -23,6 +30,7 @@ __all__ = [
     "CharacteristicMissing",
     "Driver",
     "DriverError",
+    "HistorySample",
     "Reading",
     "detect",
 ]

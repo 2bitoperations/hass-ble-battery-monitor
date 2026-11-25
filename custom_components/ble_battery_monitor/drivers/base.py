@@ -47,6 +47,20 @@ class Reading:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class HistorySample:
+    """One logged sample read back from the device's own memory.
+
+    ts is a unix timestamp. Leagend devices don't store timestamps, so theirs
+    are estimated from the newest record and the fixed logging interval.
+    """
+
+    ts: float
+    voltage: float | None = None
+    soc: int | None = None
+    temperature: float | None = None
+
+
 @dataclass(slots=True)
 class DeviceDetails:
     """Static-ish details for the device registry."""
@@ -64,12 +78,16 @@ class Driver(ABC):
     manufacturer: ClassVar[str]
     #: Reading fields this driver can fill; only these get entities.
     sensors: frozenset[str]
+    #: True if async_read_history is implemented for this model.
+    supports_history: bool = False
 
     def __init__(self, model: str) -> None:
         """Initialize for a detected model."""
         self.details = DeviceDetails(self.manufacturer, model)
         #: Recent raw traffic (direction, hex) for diagnostics.
         self.trace: deque[tuple[float, str, str]] = deque(maxlen=60)
+        #: Summary of the last history download, for diagnostics.
+        self.history_info: dict[str, Any] | None = None
 
     @classmethod
     @abstractmethod
@@ -79,6 +97,14 @@ class Driver(ABC):
     @abstractmethod
     async def async_read(self, client: BleakClient) -> Reading:
         """Read current values from a connected client. Must not hang."""
+
+    async def async_read_history(self, client: BleakClient, since: float) -> list[HistorySample]:
+        """Read logged samples newer than about `since` (unix time). Must not hang.
+
+        Called on an already-connected client, after async_read. May return
+        older samples too; the caller drops what it already has.
+        """
+        raise NotImplementedError
 
     def _trace(self, direction: str, data: bytes) -> None:
         self.trace.append((round(time.time(), 3), direction, data.hex()))
