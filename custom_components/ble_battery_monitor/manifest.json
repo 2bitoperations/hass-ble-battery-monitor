@@ -1,6 +1,9 @@
 {
   "domain": "ble_battery_monitor",
   "name": "BLE Battery Monitor",
+  "after_dependencies": [
+    "recorder"
+  ],
   "bluetooth": [
     {
       "connectable": true,
@@ -132,8 +135,5 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/2bitoperations/hass-ble-battery-monitor/issues",
   "requirements": [],
-  "version": "0.1.1",
-  "after_dependencies": [
-    "recorder"
-  ]
+  "version": "0.1.1"
 }
