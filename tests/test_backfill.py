@@ -174,3 +174,45 @@ async def test_history_disabled_in_options(hass: HomeAssistant) -> None:
     assert not entry.runtime_data.history_enabled
     assert not entry.runtime_data._history_due()
     assert hass.states.get("button.tractor_fetch_history") is None
+
+
+async def test_bk400_backfill_voltage_and_estimated_soc(hass: HomeAssistant) -> None:
+    from custom_components.ble_battery_monitor.drivers import konnwei
+
+    from .fakes import KonnweiLog, konnwei_device
+    from .test_integration import BK400
+
+    start = int(time.time()) - 5 * 3600
+    log = KonnweiLog(
+        collecting=True,
+        schedules=[(start, 86_400_000, 300_000, 1)],
+        pending=[12.50] * 61,  # 5 h at 5 min
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=BK400.address,
+        title="Pontoon",
+        data={CONF_ADDRESS: BK400.address, CONF_DRIVER: "konnwei", CONF_MODEL: "BK400"},
+    )
+    with patch.object(konnwei, "DOWNLOAD_TIMEOUT", 2.0):
+        coordinator = await _setup_and_poll(hass, entry, BK400, konnwei_device(log=log))
+    assert coordinator.last_poll_successful, coordinator.last_error
+    await async_wait_recording_done(hass)
+    assert coordinator.history_status["samples"] == 61, coordinator.history_status
+    imported = coordinator.history_status["imported_hours"]
+    assert imported["voltage"] >= 4 and imported["soc_estimate"] == imported["voltage"]
+    # Fresh 24 h schedule running on the device again.
+    assert log.collecting and log.records == []
+    assert log.schedules[0][1:] == (86_400_000, 300_000, 1)
+    stats = await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utcnow() - timedelta(hours=8),
+        None,
+        {"sensor.pontoon_estimated_state_of_charge"},
+        "hour",
+        None,
+        {"mean"},
+    )
+    # flooded, 12 V, 12.50 V -> 80 %
+    assert {r["mean"] for r in stats["sensor.pontoon_estimated_state_of_charge"]} == {80.0}

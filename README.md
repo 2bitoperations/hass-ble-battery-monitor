@@ -5,7 +5,7 @@ Bluetooth stack so it works through ESPHome Bluetooth proxies.
 
 | Family | Models | Status | Readings | History backfill |
 |---|---|---|---|---|
-| KONNWEI | BK400 | live-tested | voltage, temperature, estimated SoC | not yet (needs on-device logging schedules) |
+| KONNWEI | BK400 | live-tested | voltage, temperature, estimated SoC | voltage, estimated SoC (≤ 24 h, 5 min) |
 | KONNWEI | BK300 | untested (same framing, uses the `0B0B` voltage poll) | voltage, temperature if supported | no |
 | Leagend | BM6 | tested in simulation, live test pending | voltage, temperature, state of charge, state | voltage, SoC, temperature (~48 h) |
 | Leagend | BM2 ("Battery Monitor", ZX-1689) | live-tested | voltage, state of charge (no temperature sensor) | voltage |
@@ -29,9 +29,15 @@ Bluetooth stack so it works through ESPHome Bluetooth proxies.
 
 ### History backfill
 
-BM2 and BM6 monitors keep their own log (one record every 2 minutes). When a monitor comes back
-after being out of range (or after Home Assistant was down), the next poll also downloads that log and
-imports the missing hours into the sensors' **long-term statistics** (hourly mean/min/max).
+BM2 and BM6 monitors keep their own log (one record every 2 minutes; the BM2 sends all of it, ~70 days
+/ 200 KB, ~40 s through a proxy). The BK400 only logs inside a schedule, so with backfill on, this
+integration keeps a rolling 24 h schedule on it (a sample every 5 minutes, 288 of its 20480 slots;
+renewed while in range, replacing any schedules set in the KONNWEI app).
+
+When a monitor comes back after being out of range (more than 10 minutes without a good reading), or
+on the first poll after Home Assistant starts, the poll also downloads that log and imports the
+missing hours into the sensors' **long-term statistics** (hourly mean/min/max). The BK400's log is
+cleared after a verified (CRC-checked) download and logging restarts.
 
 - Only hours with no statistics yet are filled, so live data is never overwritten.
 - Home Assistant can't add states to the past, so a backfilled gap shows in a **Statistics graph** card

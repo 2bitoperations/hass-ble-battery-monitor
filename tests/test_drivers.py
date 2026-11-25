@@ -35,6 +35,7 @@ def fast(monkeypatch):
     monkeypatch.setattr(konnwei, "REPLY_TIMEOUT", 0.3)
     monkeypatch.setattr(konnwei, "STREAM_WAIT", 0.6)
     monkeypatch.setattr(konnwei, "STREAM_COLLECT", 0.3)
+    monkeypatch.setattr(konnwei, "DOWNLOAD_TIMEOUT", 0.5)
 
 
 def test_app_hardcoded_frame():
@@ -236,5 +237,80 @@ async def test_bm6_history_download(fast_history):
     assert len(samples) == 300  # two pages requested
 
 
-def test_konnwei_has_no_history_yet():
-    assert not KonnweiDriver("BK400").supports_history
+def test_konnwei_history_support():
+    assert KonnweiDriver("BK400").supports_history
+    assert not KonnweiDriver("BK300").supports_history
+
+
+# --- KONNWEI on-device logging -------------------------------------------------
+
+LIVE_4B04 = bytes.fromhex(
+    "24241e004b040100fefefd62066b60ea000007000000e004e004e004e004e004e004e004fefef2d70d0a"
+)
+
+
+def test_live_4b04_frame_and_records():
+    # Captured from the Pontoon BK400 on 2026-11-24 (1 record, 7 samples at 1/min).
+    assert konnwei.find_frame_end(LIVE_4B04 + bytes.fromhex("e044")) == len(LIVE_4B04)
+    samples = konnwei.parse_records(LIVE_4B04[6:-4])
+    assert [s.voltage for s in samples] == [12.48] * 7
+    assert samples[0].ts == 0x6B0662FD and samples[6].ts == 0x6B0662FD + 360
+
+
+def test_live_schedule_entry_roundtrip():
+    entry = konnwei.schedule_entry(0x6B0662FD, 3_600_000, 60_000)
+    assert entry.hex() == "fd62066b80ee360060ea000001"  # what we wrote, read back live via 4B03
+    assert konnwei.parse_schedules(entry) == [(0x6B0662FD, 3_600_000, 60_000, True)]
+
+
+def _bk400_logging(log):
+    drv = KonnweiDriver("BK400")
+    drv.logging_enabled = True
+    return drv, konnwei_device(log=log)
+
+
+async def test_bk400_starts_logging_then_backfills():
+    import time
+
+    from .fakes import KonnweiLog
+
+    log = KonnweiLog()
+    drv, client = _bk400_logging(log)
+    await drv.async_read(client)
+    assert drv.log_state["collecting"] is False and drv.history_wanted()
+    assert await drv.async_read_history(client, since=0) == []
+    ((start, dur, interval, on),) = log.schedules
+    assert (dur, interval, on) == (24 * 3_600_000, 300_000, 1) and start > time.time()
+    assert log.collecting and not drv.history_wanted()
+
+    # Some hours later: 0B0A turns the running schedule into a record; download, clear, restart.
+    log.pending = [12.50, 12.49, 12.47]
+    samples = await drv.async_read_history(client, since=0)
+    assert [s.voltage for s in samples] == [12.50, 12.49, 12.47]
+    assert [s.ts - start for s in samples] == [0, 300, 600]
+    assert log.records == [] and log.collecting
+    assert log.commands[-5:] == [0x0B09, 0x0B0A, 0x0B04, 0x0B05, 0x0B02]
+
+
+async def test_bk400_corrupt_download_keeps_log_and_keeps_logging():
+    from .fakes import KonnweiLog
+
+    log = KonnweiLog(collecting=True, schedules=[(1, 86_400_000, 300_000, 1)], pending=[12.4])
+    log.corrupt = True
+    drv, client = _bk400_logging(log)
+    with pytest.raises(DriverError, match="no log download"):
+        await drv.async_read_history(client, since=0)
+    assert 0x0B05 not in log.commands  # never clear what we couldn't read
+    assert log.records and log.collecting  # still logging
+
+
+async def test_bk400_logging_disabled_sends_no_logging_commands():
+    from .fakes import KonnweiLog
+
+    log = KonnweiLog()
+    drv = KonnweiDriver("BK400")
+    client = konnwei_device(log=log)
+    await drv.async_read(client)
+    assert not drv.history_wanted()
+    assert await drv.async_read_history(client, since=0) == []
+    assert not set(log.commands) & {0x0B02, 0x0B03, 0x0B04, 0x0B05, 0x0B09, 0x0B0A}

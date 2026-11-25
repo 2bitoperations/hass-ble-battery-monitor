@@ -68,6 +68,7 @@ def _bt(mock_bluetooth, monkeypatch):
     monkeypatch.setattr(konnwei, "REPLY_TIMEOUT", 0.3)
     monkeypatch.setattr(konnwei, "STREAM_WAIT", 0.6)
     monkeypatch.setattr(konnwei, "STREAM_COLLECT", 0.3)
+    monkeypatch.setattr(konnwei, "DOWNLOAD_TIMEOUT", 0.5)
     monkeypatch.setattr(leagend, "HISTORY_IDLE", 0.3)
     monkeypatch.setattr(leagend, "BM2_HISTORY_PAUSE", 0.0)
 
@@ -292,16 +293,23 @@ async def test_options_flow_over_http(hass: HomeAssistant, hass_client) -> None:
     form = await resp.json()
     assert {f["name"] for f in form["data_schema"]} == {
         "poll_interval",
+        "history",
         "chemistry",
         "nominal_voltage",
     }
     resp = await client.post(
         f"/api/config/config_entries/options/flow/{form['flow_id']}",
-        json={"poll_interval": 300, "chemistry": "agm", "nominal_voltage": "12"},
+        json={"poll_interval": 300, "history": False, "chemistry": "agm", "nominal_voltage": "12"},
     )
     assert resp.status == 200, await resp.text()
     await hass.async_block_till_done()
-    assert entry.options == {"poll_interval": 300, "chemistry": "agm", "nominal_voltage": "12"}
+    assert entry.options == {
+        "poll_interval": 300,
+        "history": False,
+        "chemistry": "agm",
+        "nominal_voltage": "12",
+    }
+    assert not entry.runtime_data.driver.logging_enabled
     assert entry.runtime_data.chemistry == "agm"
     assert entry.runtime_data.poll_interval == 300
 

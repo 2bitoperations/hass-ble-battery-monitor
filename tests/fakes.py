@@ -58,6 +58,65 @@ def konnwei_reply(cmd: int, payload: bytes) -> bytes:
     return body + struct.pack("<H", konnwei.crc16_x25(body)) + b"\r\n"
 
 
+@dataclass
+class KonnweiLog:
+    """BK400 data-logging state, as observed live."""
+
+    schedules: list[tuple[int, int, int, int]] = field(default_factory=list)
+    collecting: bool = False
+    #: Samples logged by the running schedule so far (volts).
+    pending: list[float] = field(default_factory=list)
+    records: list[tuple[int, int, list[float]]] = field(default_factory=list)
+    commands: list[int] = field(default_factory=list)
+    corrupt: bool = False
+
+    def handle(self, client: FakeClient, cmd: int, payload: bytes) -> bool:
+        self.commands.append(cmd)
+        send = lambda c, p=b"": client.notify("fff1", konnwei_reply(c, p))  # noqa: E731
+        if cmd == 0x0B01:
+            used = sum(d // i for _s, d, i, on in self.schedules if on)
+            send(0x4B01, struct.pack("<I", 20480 - used))
+        elif cmd == 0x0B09:
+            send(0x4B09, bytes([1 if self.collecting else 0]))
+        elif cmd == 0x0B03:
+            send(0x4B03, b"".join(struct.pack("<IIIB", *e) for e in self.schedules))
+        elif cmd == 0x0B02:
+            self.schedules = [
+                struct.unpack_from("<IIIB", payload, i) for i in range(0, len(payload), 13)
+            ]
+            self.collecting = any(e[3] for e in self.schedules)
+            send(0x4B02, b"\x00")
+        elif cmd == 0x0B0A:
+            if self.collecting and self.pending:
+                start, _d, interval, _on = self.schedules[0]
+                self.records.append((start, interval, self.pending))
+            self.pending, self.collecting = [], False
+            send(0x4B0A)
+        elif cmd == 0x0B04:
+            self._download(client)
+        elif cmd == 0x0B05:
+            self.records.clear()
+            send(0x4B05, b"\x00")
+        else:
+            return False
+        return True
+
+    def _download(self, client: FakeClient) -> None:
+        body = struct.pack("<H", len(self.records)) + b"\xfe\xfe"
+        for start, interval, volts in self.records:
+            body += struct.pack("<III", start, interval, len(volts))
+            body += b"".join(struct.pack("<H", round(v * 100)) for v in volts) + b"\xfe\xfe"
+        head = b"\x24\x24" + struct.pack("<H", 0x1E) + b"\x4b\x04"  # LEN doesn't match (as live)
+        raw = head + body
+        crc = konnwei.crc16_x25(raw) ^ (1 if self.corrupt else 0)
+        raw += struct.pack("<H", crc) + b"\r\n"
+        sample = struct.pack("<H", 0x4000 | 1248)
+        for i in range(0, len(raw), 17):
+            client.notify("fff1", raw[i : i + 17])
+            client.notify("fff1", sample)  # live stream keeps going in between
+        client.notify("fff1", sample + sample)
+
+
 def konnwei_device(
     *,
     volts: float = 12.65,
@@ -66,8 +125,12 @@ def konnwei_device(
     mode: int = 0,
     dev_name: bytes = b"BK400",
     answer: set[int] | None = None,
+    log: KonnweiLog | None = None,
 ) -> FakeClient:
-    """BK400 (streaming=True) or BK300-like (streaming=False, answers 0B0B)."""
+    """BK400 (streaming=True) or BK300-like (streaming=False, answers 0B0B).
+
+    log: simulate on-device data logging (schedules, records, download, clear).
+    """
     svc = FakeService(
         uuid16("fff0"),
         [
@@ -104,6 +167,8 @@ def konnwei_device(
                     await asyncio.sleep(0.2)
 
             client.tasks.append(asyncio.get_running_loop().create_task(stream()))
+        elif log is not None and log.handle(client, cmd, data[6 : n - 4]):
+            pass
         elif cmd == 0x0B01:
             client.notify("fff1", konnwei_reply(0x4B01, b"\x00"))
         elif cmd == 0x0B0B and not streaming:

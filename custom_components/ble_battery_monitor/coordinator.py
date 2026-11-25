@@ -66,6 +66,9 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, driver: Driver) -> None:
         self.entry = entry
         self.driver = driver
+        driver.logging_enabled = driver.supports_history and bool(
+            entry.options.get(CONF_HISTORY, DEFAULT_HISTORY)
+        )
         self.last_success: float | None = None  # wall clock of last good reading
         self.last_error: str | None = None
         self._polling = False
@@ -111,7 +114,10 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         return int(self.entry.options.get(CONF_NOMINAL_VOLTAGE, DEFAULT_NOMINAL_VOLTAGE))
 
     def _history_due(self) -> bool:
-        if not self.history_enabled or self._history_since is None:
+        if not self.history_enabled:
+            return False
+        # A gap to fill, or (KONNWEI) the on-device logging schedule needs renewing.
+        if self._history_since is None and not self.driver.history_wanted():
             return False
         return self._history_attempt is None or time.time() - self._history_attempt >= HISTORY_RETRY
 

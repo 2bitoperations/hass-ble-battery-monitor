@@ -98,6 +98,13 @@ class Driver(ABC):
     async def async_read(self, client: BleakClient) -> Reading:
         """Read current values from a connected client. Must not hang."""
 
+    #: Set from options: the driver may manage on-device logging (KONNWEI).
+    logging_enabled: bool = False
+
+    def history_wanted(self) -> bool:
+        """True if the device wants a history cycle even without a gap."""
+        return False
+
     async def async_read_history(self, client: BleakClient, since: float) -> list[HistorySample]:
         """Read logged samples newer than about `since` (unix time). Must not hang.
 

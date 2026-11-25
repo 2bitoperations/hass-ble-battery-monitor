@@ -11,8 +11,21 @@ Between frames the BK400 streams raw u16 samples: bits 15-14 type, 13-0 centivol
 type 1 is the live battery voltage.
 
 Only commands the vendor app sends on every connect are used here, plus the
-BK300 voltage poll 0B0B. Never OTA (03xx), delete (0A03), rename (0C02),
-logging (0B02-0B06/0B0A) or factory (01/09/19xx) commands.
+BK300 voltage poll 0B0B and, if history is enabled, the app's data-logging
+commands. Never OTA (03xx), delete-all (0A03), rename (0C02) or factory
+(01/09/19xx) commands.
+
+History (BK400; verified live 2026-11-24): the device only logs inside
+"collection schedules" (0B02). HA keeps one rolling schedule (24 h, a sample
+every 5 min = 288 of the 20480 slots), renewed when under 12 h is left. To
+read it: 0B0A stops collecting (turning it into a record), 0B04 returns all
+records, 0B05 clears them, 0B02 starts a new schedule. A running schedule
+reads back as no records, hence the stop.
+  0B02/4B03 entry: u32 start, u32 duration ms, u32 interval ms, u8 enabled
+  4B04: u16 n, FE FE, then per record u32 start, u32 interval ms, u32 count,
+        count x u16 centivolts, FE FE. Spread over several notifications; the
+        LEN field doesn't match, but the CRC covers the raw frame.
+  4B01 payload: u32 free sample slots (minus slots reserved by schedules).
 """
 
 from __future__ import annotations
@@ -27,7 +40,7 @@ from typing import TYPE_CHECKING
 
 from bleak.exc import BleakError
 
-from .base import Advertisement, Driver, DriverError, Reading, find_char
+from .base import Advertisement, Driver, DriverError, HistorySample, Reading, find_char
 
 if TYPE_CHECKING:
     from bleak import BleakClient
@@ -43,6 +56,19 @@ CMD_HOME = 0x0100
 CMD_TIME = 0x0B01
 CMD_VOLTAGE = 0x0B0B  # BK300 poll; BK400 normally streams instead
 CMD_TEMPERATURE = 0x0B0C
+CMD_LOG_WRITE = 0x0B02
+CMD_LOG_SCHEDULES = 0x0B03
+CMD_LOG_DOWNLOAD = 0x0B04
+CMD_LOG_CLEAR = 0x0B05
+CMD_LOG_STATUS = 0x0B09
+CMD_LOG_STOP = 0x0B0A
+
+LOG_INTERVAL_MS = 5 * 60_000
+LOG_DURATION_MS = 24 * 3_600_000  # the app's maximum
+LOG_RENEW = 12 * 3600  # renew the schedule when less than this is left
+LOG_START_DELAY = 5  # schedules must start in the future
+LOG_SEPARATOR = b"\xfe\xfe"
+DOWNLOAD_TIMEOUT = 30.0
 
 REPLY_TIMEOUT = 3.0
 STREAM_WAIT = 4.0  # how long to wait for the BK400 voltage stream
@@ -160,6 +186,59 @@ def parse_voltage_poll(payload: bytes) -> float | None:
     return v if 0.0 < v <= MAX_VOLTS else None
 
 
+def schedule_entry(start: int, duration_ms: int, interval_ms: int, enabled: bool = True) -> bytes:
+    return struct.pack("<IIIB", start, duration_ms, interval_ms, 1 if enabled else 0)
+
+
+def parse_schedules(payload: bytes) -> list[tuple[int, int, int, bool]]:
+    """4B03: (start, duration ms, interval ms, enabled); 13- or 17-byte entries."""
+    if not payload:
+        return []
+    stride = 17 if len(payload) % 17 == 0 and len(payload) % 13 else 13
+    out = []
+    for i in range(0, len(payload) - stride + 1, stride):
+        start, dur, intv, flag = struct.unpack_from("<IIIB", payload, i)
+        out.append((start, dur, intv, flag == 1))
+    return out
+
+
+def _skip_sep(data: bytes, pos: int) -> int:
+    return pos + 2 if data[pos : pos + 2] == LOG_SEPARATOR else pos
+
+
+def parse_records(payload: bytes) -> list[HistorySample]:
+    """4B04 payload -> samples (record start + i * interval)."""
+    if len(payload) < 2:
+        raise DriverError("short 4B04")
+    (n,) = struct.unpack_from("<H", payload)
+    pos = _skip_sep(payload, 2)
+    out: list[HistorySample] = []
+    for _ in range(n):
+        if pos + 12 > len(payload):
+            raise DriverError("truncated 4B04 record header")
+        start, interval_ms, count = struct.unpack_from("<III", payload, pos)
+        pos += 12
+        if pos + 2 * count > len(payload) or interval_ms == 0:
+            raise DriverError("truncated 4B04 record")
+        for i, (w,) in enumerate(struct.iter_unpack("<H", payload[pos : pos + 2 * count])):
+            v = (w & 0x3FFF) / 100.0
+            if 0.0 < v <= MAX_VOLTS:
+                out.append(HistorySample(ts=start + i * interval_ms / 1000, voltage=v))
+        pos = _skip_sep(payload, pos + 2 * count)
+    return out
+
+
+def find_frame_end(buf: bytes | bytearray) -> int | None:
+    """End offset of a complete frame in buf: CRLF where the CRC also checks out."""
+    i = buf.find(b"\r\n", 8)
+    while i >= 0:
+        n = i + 2
+        if struct.unpack_from("<H", buf, n - 4)[0] == crc16_x25(bytes(buf[: n - 4])):
+            return n
+        i = buf.find(b"\r\n", i + 1)
+    return None
+
+
 def mac_bytes(address: str) -> bytes | None:
     try:
         return bytes.fromhex(address.replace(":", "").replace("-", ""))
@@ -194,75 +273,34 @@ class KonnweiDriver(Driver):
     def __init__(self, model: str) -> None:
         super().__init__(model)
         self._info: dict[str, str | int] | None = None
+        #: Set by the coordinator from options: manage on-device logging.
+        self.logging_enabled = False
+        self.supports_history = model == "BK400"
+        #: From the last poll: (collecting, end of the running schedule).
+        self.log_state: dict[str, object] | None = None
 
     @property
     def info(self) -> dict[str, str | int] | None:
         return self._info
 
+    def history_wanted(self) -> bool:
+        """True if the on-device schedule needs (re)starting soon."""
+        state = self.log_state
+        if not (self.logging_enabled and self.supports_history) or state is None:
+            return False
+        end = state.get("ends")
+        return not state.get("collecting") or end is None or end - time.time() < LOG_RENEW
+
     async def async_read(self, client: BleakClient) -> Reading:
-        notify_char = find_char(client, SERVICE, want="notify", prefer=NOTIFY)
-        try:
-            write_char = find_char(client, SERVICE, want="write-without-response")
-            write_response = False
-        except DriverError:
-            write_char = find_char(client, SERVICE, want="write")
-            write_response = True
-
-        loop = asyncio.get_running_loop()
-        decoder = StreamDecoder()
-        waiters: dict[int, asyncio.Future[Frame]] = {}
-        volts: list[float] = []
-        got_volts = asyncio.Event()
-        other_samples: dict[int, int] = {}
-
-        def on_notify(_char: object, data: bytearray) -> None:
-            raw = bytes(data)
-            self._trace("rx", raw)
-            for item in decoder.feed(raw):
-                if isinstance(item, Frame):
-                    if not item.crc_ok:
-                        _LOGGER.debug("%s: CRC mismatch %r", client.address, item)
-                        continue
-                    fut = waiters.pop(item.cmd, None)
-                    if fut is not None and not fut.done():
-                        fut.set_result(item)
-                    else:
-                        _LOGGER.debug("%s: unsolicited %r", client.address, item)
-                else:
-                    kind, v = item
-                    if kind == 1 and 0.0 < v <= MAX_VOLTS:
-                        volts.append(v)
-                        got_volts.set()
-                    else:
-                        other_samples[kind] = other_samples.get(kind, 0) + 1
-
-        async def send(cmd: int, payload: bytes = b"", *, reply: bool = True) -> Frame | None:
-            fut: asyncio.Future[Frame] | None = None
-            if reply:
-                fut = loop.create_future()
-                waiters[cmd | 0x4000] = fut
-            frame = build_request(cmd, payload)
-            self._trace("tx", frame)
-            await client.write_gatt_char(write_char, frame, response=write_response)
-            if fut is None:
-                return None
-            try:
-                async with asyncio.timeout(REPLY_TIMEOUT):
-                    return await fut
-            except TimeoutError:
-                _LOGGER.debug("%s: no reply to %04X", client.address, cmd)
-                return None
-            finally:
-                waiters.pop(cmd | 0x4000, None)
-
-        await client.start_notify(notify_char, on_notify)
+        session = _Session(self, client)
+        await session.start()
         try:
             # Same opening sequence as the vendor app (DeviceViewModel).
-            mode = await send(CMD_MODE)
+            mode = await session.send(CMD_MODE)
             if mode is not None and mode.payload[:1] not in (b"", b"\x00"):
                 raise DriverError("device is in firmware-update mode; not touching it")
             if self._info is None:
-                info = await send(CMD_INFO)
+                info = await session.send(CMD_INFO)
                 if info is not None:
                     self._info = parse_info(info.payload)
                     name = str(self._info.get("dev_name") or "")
@@ -270,24 +308,26 @@ class KonnweiDriver(Driver):
                         self.details.model = name
                     self.details.sw_version = str(self._info.get("mcu_ver") or "") or None
                     self.details.hw_version = str(self._info.get("iap_ver") or "") or None
-            await send(CMD_HOME, reply=False)
-            await send(CMD_TIME, struct.pack("<I", int(time.time())))
+            await session.send(CMD_HOME, reply=False)
+            await session.time_sync()
 
+            volts = session.volts
             if not volts:
                 with suppress(TimeoutError):
                     async with asyncio.timeout(STREAM_WAIT):
-                        await got_volts.wait()
+                        await session.got_volts.wait()
             if volts:
                 await asyncio.sleep(STREAM_COLLECT)
             else:
-                poll = await send(CMD_VOLTAGE)
+                poll = await session.send(CMD_VOLTAGE)
                 if poll is not None and (v := parse_voltage_poll(poll.payload)) is not None:
                     volts.append(v)
 
-            temp_frame = await send(CMD_TEMPERATURE)
+            temp_frame = await session.send(CMD_TEMPERATURE)
+            if self.logging_enabled and self.supports_history:
+                await self._read_log_state(session)
         finally:
-            with suppress(BleakError, EOFError):
-                await client.stop_notify(notify_char)
+            await session.stop()
 
         if not volts:
             raise DriverError("no voltage received")
@@ -296,5 +336,190 @@ class KonnweiDriver(Driver):
             voltage=round(statistics.median(recent), 2),
             temperature=parse_temperature(temp_frame.payload) if temp_frame else None,
         )
-        reading.extra = {"samples": len(volts), "other_samples": other_samples}
+        reading.extra = {"samples": len(volts), "other_samples": session.other_samples}
         return reading
+
+    async def _read_log_state(self, session: _Session) -> None:
+        status = await session.send(CMD_LOG_STATUS)
+        sched = await session.send(CMD_LOG_SCHEDULES)
+        if status is None or sched is None:
+            return  # unknown: leave the previous state
+        schedules = parse_schedules(sched.payload)
+        now = time.time()
+        ends = [s + d / 1000 for s, d, _i, on in schedules if on and s + d / 1000 > now]
+        self.log_state = {
+            "collecting": status.payload[:1] not in (b"", b"\x00"),
+            "ends": max(ends) if ends else None,
+            "schedules": schedules,
+            "free_slots": session.free_slots,
+        }
+
+    async def async_read_history(self, client: BleakClient, since: float) -> list[HistorySample]:
+        """Stop logging, download and clear the log, then start a fresh schedule."""
+        if not self.logging_enabled:
+            return []
+        session = _Session(self, client)
+        await session.start()
+        samples: list[HistorySample] = []
+        error: str | None = None
+        raw: bytes | None = None
+        try:
+            await session.time_sync()
+            status = await session.send(CMD_LOG_STATUS)
+            collecting = status is not None and status.payload[:1] not in (b"", b"\x00")
+            if collecting and await session.send(CMD_LOG_STOP) is None:
+                raise DriverError("no reply to stop-logging")
+            raw = await session.download()
+            if raw is None:
+                error = "no log download"
+            else:
+                try:
+                    samples = parse_records(raw[6:-4])
+                except DriverError as err:
+                    error = str(err)  # keep the log on the device; retried later
+                else:
+                    if await session.send(CMD_LOG_CLEAR) is None:
+                        error = "no reply to clear-log"
+            # Always restart logging, even if the download failed (the log is kept then).
+            start = int(time.time()) + LOG_START_DELAY
+            entry = schedule_entry(start, LOG_DURATION_MS, LOG_INTERVAL_MS)
+            ack = await session.send(CMD_LOG_WRITE, entry)
+            if ack is None or ack.payload[:1] not in (b"", b"\x00"):
+                error = error or "schedule not accepted"
+            self.log_state = {
+                "collecting": True,
+                "ends": start + LOG_DURATION_MS / 1000,
+                "schedules": [(start, LOG_DURATION_MS, LOG_INTERVAL_MS, True)],
+                "free_slots": session.free_slots,
+            }
+        finally:
+            await session.stop()
+        self.history_info = {
+            "records_bytes": None if raw is None else len(raw),
+            "samples": len(samples),
+            "error": error,
+            "at": round(time.time()),
+        }
+        if error:
+            raise DriverError(error)
+        return samples
+
+
+class _Session:
+    """One notify subscription: request/reply, the voltage stream, and log downloads."""
+
+    def __init__(self, driver: KonnweiDriver, client: BleakClient) -> None:
+        self.driver, self.client = driver, client
+        self.notify_char = find_char(client, SERVICE, want="notify", prefer=NOTIFY)
+        try:
+            self.write_char = find_char(client, SERVICE, want="write-without-response")
+            self.write_response = False
+        except DriverError:
+            self.write_char = find_char(client, SERVICE, want="write")
+            self.write_response = True
+        self.decoder = StreamDecoder()
+        self.waiters: dict[int, asyncio.Future[Frame]] = {}
+        self.volts: list[float] = []
+        self.got_volts = asyncio.Event()
+        self.other_samples: dict[int, int] = {}
+        self.free_slots: int | None = None
+        self._capture: bytearray | None = None
+        self._captured: asyncio.Future[bytes] | None = None
+
+    async def start(self) -> None:
+        await self.client.start_notify(self.notify_char, self._on_notify)
+
+    async def stop(self) -> None:
+        with suppress(BleakError, EOFError):
+            await self.client.stop_notify(self.notify_char)
+
+    def _on_notify(self, _char: object, data: bytearray) -> None:
+        raw = bytes(data)
+        self.driver._trace("rx", raw)
+        if self._capture is not None:
+            raw = self._capture_feed(raw)
+        if raw:
+            self._dispatch(raw)
+
+    def _capture_feed(self, raw: bytes) -> bytes:
+        """Collect a multi-notification 4B04; return whatever isn't part of it."""
+        buf = self._capture
+        assert buf is not None
+        if not buf:
+            i = raw.find(b"\x24\x24")
+            if i < 0 or raw[i + 4 : i + 6] != struct.pack(">H", CMD_LOG_DOWNLOAD | 0x4000):
+                return raw
+            if i:
+                self._dispatch(raw[:i])
+            raw = raw[i:]
+        elif len(raw) == 2 and find_frame_end(buf + raw) is None:
+            return raw  # a live voltage sample between fragments
+        buf += raw
+        end = find_frame_end(buf)
+        if end is None:
+            return b""
+        frame, rest = bytes(buf[:end]), bytes(buf[end:])
+        self._capture = None
+        if self._captured is not None and not self._captured.done():
+            self._captured.set_result(frame)
+        return rest
+
+    def _dispatch(self, raw: bytes) -> None:
+        for item in self.decoder.feed(raw):
+            if isinstance(item, Frame):
+                if not item.crc_ok:
+                    _LOGGER.debug("%s: CRC mismatch %r", self.client.address, item)
+                    continue
+                if item.cmd == CMD_TIME | 0x4000 and len(item.payload) >= 4:
+                    self.free_slots = struct.unpack_from("<I", item.payload)[0]
+                fut = self.waiters.pop(item.cmd, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(item)
+                else:
+                    _LOGGER.debug("%s: unsolicited %r", self.client.address, item)
+            else:
+                kind, v = item
+                if kind == 1 and 0.0 < v <= MAX_VOLTS:
+                    self.volts.append(v)
+                    self.got_volts.set()
+                else:
+                    self.other_samples[kind] = self.other_samples.get(kind, 0) + 1
+
+    async def _write(self, cmd: int, payload: bytes) -> None:
+        frame = build_request(cmd, payload)
+        self.driver._trace("tx", frame)
+        await self.client.write_gatt_char(self.write_char, frame, response=self.write_response)
+
+    async def send(self, cmd: int, payload: bytes = b"", *, reply: bool = True) -> Frame | None:
+        fut: asyncio.Future[Frame] | None = None
+        if reply:
+            fut = asyncio.get_running_loop().create_future()
+            self.waiters[cmd | 0x4000] = fut
+        await self._write(cmd, payload)
+        if fut is None:
+            return None
+        try:
+            async with asyncio.timeout(REPLY_TIMEOUT):
+                return await fut
+        except TimeoutError:
+            _LOGGER.debug("%s: no reply to %04X", self.client.address, cmd)
+            return None
+        finally:
+            self.waiters.pop(cmd | 0x4000, None)
+
+    async def time_sync(self) -> Frame | None:
+        return await self.send(CMD_TIME, struct.pack("<I", int(time.time())))
+
+    async def download(self) -> bytes | None:
+        """0B04 -> the complete raw 4B04 frame (CRC-checked), or None."""
+        self._capture = bytearray()
+        self._captured = asyncio.get_running_loop().create_future()
+        try:
+            await self._write(CMD_LOG_DOWNLOAD, b"")
+            async with asyncio.timeout(DOWNLOAD_TIMEOUT):
+                return await self._captured
+        except TimeoutError:
+            return None
+        finally:
+            self._capture = None
+            self._captured = None
