@@ -376,3 +376,83 @@ async def test_konnwei_command_service(hass: HomeAssistant) -> None:
                     blocking=True,
                     return_response=True,
                 )
+
+
+def _bk400_entry() -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=BK400.address,
+        title="BK400 1234",
+        data={CONF_ADDRESS: BK400.address, CONF_DRIVER: "konnwei", CONF_MODEL: "BK400"},
+    )
+
+
+def _heard_at(t: float):
+    info = service_info(BK400.address, dict(BK400.manufacturer_data), list(BK400.service_uuids))
+    object.__setattr__(info, "time", t)
+    return info
+
+
+async def test_failed_poll_backs_off_and_waits_for_a_fresh_advert(hass: HomeAssistant) -> None:
+    """Marginal link: don't reconnect blind every minute; wait for a new sighting, back off."""
+    coordinator = await _setup_and_poll(hass, _bk400_entry(), BK400, konnwei_device(answer=set()))
+    assert not coordinator.last_poll_successful
+    assert coordinator.consecutive_failures == 1
+    attempt = coordinator._last_attempt
+    assert attempt is not None
+
+    base = "custom_components.ble_battery_monitor.coordinator.bluetooth"
+    with patch(f"{base}.async_ble_device_from_address", return_value=BK400.device):
+        # The timer re-feeds the sighting the failed attempt already used: no retry.
+        assert not coordinator._needs_poll(_heard_at(attempt - 1), 3600)
+        # Heard again since then: retry once the back-off has passed.
+        fresh = _heard_at(attempt + 5)
+        assert not coordinator._needs_poll(fresh, 30)
+        assert coordinator._needs_poll(fresh, 61)
+
+    # 60 s, then doubling, capped at 10 min (poll interval 120 s).
+    dues = []
+    for n in range(1, 7):
+        coordinator.consecutive_failures = n
+        dues.append(coordinator.retry_due)
+    assert dues == [60, 120, 240, 480, 600, 600]
+    coordinator.consecutive_failures = 0
+    assert coordinator.retry_due == coordinator.poll_interval
+
+
+async def test_success_resets_backoff(hass: HomeAssistant) -> None:
+    coordinator = await _setup_and_poll(hass, _bk400_entry(), BK400, konnwei_device())
+    assert coordinator.last_poll_successful and coordinator.consecutive_failures == 0
+    base = "custom_components.ble_battery_monitor.coordinator.bluetooth"
+    with patch(f"{base}.async_ble_device_from_address", return_value=BK400.device):
+        # No failure outstanding: an old sighting is fine once the interval has passed.
+        assert coordinator._needs_poll(_heard_at(0), coordinator.poll_interval + 1)
+
+
+async def test_each_connect_attempt_asks_ha_for_the_best_proxy(hass: HomeAssistant) -> None:
+    """Retries must not stick to the proxy that just failed."""
+    entry = _bk400_entry()
+    entry.add_to_hass(hass)
+    first = BLEDevice(BK400.address, None, {"source": "gate"})
+    better = BLEDevice(BK400.address, None, {"source": "other-proxy"})
+    picks = iter([first, first, better])
+    connect = AsyncMock(side_effect=lambda *a, **k: _fake_bk400())
+    base = "custom_components.ble_battery_monitor.coordinator"
+    with (
+        patch(
+            f"{base}.bluetooth.async_ble_device_from_address",
+            side_effect=lambda *a, **k: next(picks, better),
+        ),
+        patch(f"{base}.establish_connection", connect),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        coordinator = entry.runtime_data
+        coordinator._async_handle_bluetooth_event(BK400, BluetoothChange.ADVERTISEMENT)
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert connect.await_count == 1
+        args, kwargs = connect.call_args
+        assert args[1] is first
+        # bleak-retry-connector calls this before each retry.
+        assert kwargs["ble_device_callback"]() is better
+    assert await hass.config_entries.async_unload(entry.entry_id)

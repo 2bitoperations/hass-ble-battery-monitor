@@ -314,3 +314,57 @@ async def test_bk400_logging_disabled_sends_no_logging_commands():
     assert not drv.history_wanted()
     assert await drv.async_read_history(client, since=0) == []
     assert not set(log.commands) & {0x0B02, 0x0B03, 0x0B04, 0x0B05, 0x0B09, 0x0B0A}
+
+
+async def test_bk400_clear_unacknowledged_still_returns_samples():
+    """Marginal link: the download is good but the 4B05 reply is lost. Keep the data."""
+    from .fakes import KonnweiLog
+
+    log = KonnweiLog(
+        collecting=True, schedules=[(1_000, 86_400_000, 300_000, 1)], pending=[12.48, 12.47]
+    )
+    log.drop = {0x0B05}
+    drv, client = _bk400_logging(log)
+    samples = await drv.async_read_history(client, since=0)
+    assert [s.voltage for s in samples] == [12.48, 12.47]
+    assert drv.history_info["error"] == "no reply to clear-log"
+    assert log.records  # not cleared: the next download repeats them (import skips them)
+    assert log.collecting and drv.log_state["collecting"]  # fresh schedule still written
+
+
+async def test_bk400_link_lost_after_download_still_returns_samples():
+    from .fakes import KonnweiLog
+
+    log = KonnweiLog(collecting=True, schedules=[(1_000, 86_400_000, 300_000, 1)], pending=[12.5])
+    log.fail = {0x0B05}
+    drv, client = _bk400_logging(log)
+    samples = await drv.async_read_history(client, since=0)
+    assert [s.voltage for s in samples] == [12.5]
+    assert drv.history_info["error"].startswith("link lost after download")
+    # Schedule state unknown, so it's treated as not logging and rewritten next time.
+    assert drv.log_state["collecting"] is False and drv.history_wanted()
+
+
+async def test_bk400_link_lost_before_download_raises():
+    from bleak.exc import BleakError
+
+    from .fakes import KonnweiLog
+
+    log = KonnweiLog(collecting=True, schedules=[(1_000, 86_400_000, 300_000, 1)], pending=[12.5])
+    log.fail = {0x0B04}
+    drv, client = _bk400_logging(log)
+    with pytest.raises(BleakError):
+        await drv.async_read_history(client, since=0)
+    assert 0x0B05 not in log.commands
+
+
+async def test_bk400_schedule_not_accepted_is_not_reported_as_logging():
+    from .fakes import KonnweiLog
+
+    log = KonnweiLog(collecting=True, schedules=[(1_000, 86_400_000, 300_000, 1)], pending=[12.5])
+    log.drop = {0x0B02}
+    drv, client = _bk400_logging(log)
+    samples = await drv.async_read_history(client, since=0)
+    assert len(samples) == 1 and not log.records  # downloaded and cleared
+    assert drv.history_info["error"] == "schedule not accepted"
+    assert drv.log_state["collecting"] is False and drv.history_wanted()

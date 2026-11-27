@@ -69,9 +69,19 @@ class KonnweiLog:
     records: list[tuple[int, int, list[float]]] = field(default_factory=list)
     commands: list[int] = field(default_factory=list)
     corrupt: bool = False
+    #: Commands the device receives but whose reply is lost (marginal link).
+    drop: set[int] = field(default_factory=set)
+    #: Commands whose write fails: the link drops (BleakError).
+    fail: set[int] = field(default_factory=set)
 
     def handle(self, client: FakeClient, cmd: int, payload: bytes) -> bool:
         self.commands.append(cmd)
+        if cmd in self.fail:
+            from bleak.exc import BleakError
+
+            raise BleakError("Disconnected")
+        if cmd in self.drop:
+            return True
         send = lambda c, p=b"": client.notify("fff1", konnwei_reply(c, p))  # noqa: E731
         if cmd == 0x0B01:
             used = sum(d // i for _s, d, i, on in self.schedules if on)

@@ -8,8 +8,10 @@ from datetime import datetime, timedelta
 import logging
 import time
 
+from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.active_update_coordinator import (
     ActiveBluetoothDataUpdateCoordinator,
@@ -37,6 +39,7 @@ from .const import (
     POLL_TIMEOUT,
     POLL_TIMER,
     RETRY_INTERVAL,
+    RETRY_MAX,
     STALE_INTERVALS,
     STALE_MIN,
 )
@@ -72,6 +75,10 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         self.last_success: float | None = None  # wall clock of last good reading
         self.last_error: str | None = None
         self._polling = False
+        #: Failed polls in a row (drives the retry back-off).
+        self.consecutive_failures = 0
+        #: Monotonic time of the last connection attempt (adverts are stamped on this clock).
+        self._last_attempt: float | None = None
         #: Serializes connections (polls and service calls).
         self.lock = asyncio.Lock()
         self._force_poll = False
@@ -80,6 +87,8 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         self._history_since: float | None = time.time() - HISTORY_MAX_AGE
         self._history_attempt: float | None = None
         self.history_status: dict[str, object] = {}
+        #: A step after a good download that wasn't acknowledged (shown in diagnostics).
+        self._history_warning: str | None = None
         super().__init__(
             hass,
             _LOGGER,
@@ -166,18 +175,54 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         if self._force_poll:
             self._force_poll = False
             return True
-        due = (
-            self.poll_interval
-            if self.last_poll_successful
-            else min(self.poll_interval, RETRY_INTERVAL)
-        )
-        if seconds_since_poll is not None and seconds_since_poll < due:
+        if seconds_since_poll is not None and seconds_since_poll < self.retry_due:
+            return False
+        if (
+            self.consecutive_failures
+            and self._last_attempt is not None
+            and service_info.time <= self._last_attempt
+        ):
+            # Not heard since the attempt that failed: the timer is only re-feeding the old
+            # sighting, and connecting blind just keeps the proxy busy (and not scanning).
             return False
         return (
             bluetooth.async_ble_device_from_address(
                 self.hass, service_info.device.address, connectable=True
             )
             is not None
+        )
+
+    @property
+    def retry_due(self) -> float:
+        """Seconds to wait after the last poll: the interval, or the back-off after failures."""
+        if not self.consecutive_failures:
+            return self.poll_interval
+        first = min(self.poll_interval, RETRY_INTERVAL)
+        backoff = first * 2 ** min(self.consecutive_failures - 1, 16)
+        return min(backoff, max(RETRY_MAX, self.poll_interval))
+
+    def _ble_device_callback(self, fallback: BLEDevice) -> Callable[[], BLEDevice]:
+        """Fresh best path for each connect attempt.
+
+        HA picks the proxy by signal strength and penalises one after failed connects, but only
+        when asked again. Without this, every retry goes back to the proxy that just failed.
+        """
+
+        def _best() -> BLEDevice:
+            return (
+                bluetooth.async_ble_device_from_address(self.hass, self.address, connectable=True)
+                or fallback
+            )
+
+        return _best
+
+    async def _establish(self, ble_device: BLEDevice) -> BleakClientWithServiceCache:
+        return await establish_connection(
+            BleakClientWithServiceCache,
+            ble_device,
+            ble_device.name or ble_device.address,
+            max_attempts=CONNECT_ATTEMPTS,
+            ble_device_callback=self._ble_device_callback(ble_device),
         )
 
     async def _poll(self, service_info: bluetooth.BluetoothServiceInfoBleak) -> Reading:
@@ -195,12 +240,7 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         )
         if ble_device is None:
             raise BleakError("not currently reachable by any connectable scanner")
-        return await establish_connection(
-            BleakClientWithServiceCache,
-            ble_device,
-            ble_device.name or ble_device.address,
-            max_attempts=CONNECT_ATTEMPTS,
-        )
+        return await self._establish(ble_device)
 
     async def _poll_once(self, service_info: bluetooth.BluetoothServiceInfoBleak) -> Reading:
         ble_device = (
@@ -209,6 +249,16 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
             )
             or service_info.device
         )
+        self._last_attempt = monotonic_time_coarse()
+        try:
+            reading = await self._poll_connection(ble_device)
+        except BaseException:
+            self.consecutive_failures += 1
+            raise
+        self.consecutive_failures = 0
+        return reading
+
+    async def _poll_connection(self, ble_device: BLEDevice) -> Reading:
         now = time.time()
         if self.last_success is not None and now - self.last_success > HISTORY_GAP:
             gap_start = self.last_success
@@ -218,12 +268,7 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         try:
             try:
                 async with asyncio.timeout(POLL_TIMEOUT):
-                    client = await establish_connection(
-                        BleakClientWithServiceCache,
-                        ble_device,
-                        ble_device.name or ble_device.address,
-                        max_attempts=CONNECT_ATTEMPTS,
-                    )
+                    client = await self._establish(ble_device)
                     try:
                         reading = await self.driver.async_read(client)
                     except CharacteristicMissing:
@@ -270,8 +315,16 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
             self.history_status = {"at": round(time.time()), "error": msg}
             _LOGGER.warning("%s: history download failed (%s); will retry", self.address, msg)
             return None
-        self._history_since = None
-        self._history_attempt = None  # the retry back-off only follows failures
+        self._history_since = None  # the gap is covered (the samples are in hand)
+        if error := (self.driver.history_info or {}).get("error"):
+            # Downloaded, but a later step (clearing the device log, restarting its
+            # schedule) wasn't acknowledged. Keep the samples, and redo that step after
+            # the usual back-off instead of on the very next poll.
+            self._history_warning = error
+            _LOGGER.info("%s: history downloaded, but %s; will retry", self.address, error)
+        else:
+            self._history_warning = None
+            self._history_attempt = None  # the retry back-off only follows failures
         return samples
 
     async def _async_import(self, samples: list[HistorySample]) -> None:
@@ -294,6 +347,8 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
             "oldest": round(samples[0].ts) if samples else None,
             "newest": round(samples[-1].ts) if samples else None,
         }
+        if self._history_warning:
+            status["warning"] = self._history_warning
         try:
             status["imported_hours"] = await async_import_history(
                 self.hass, self.address, samples, values

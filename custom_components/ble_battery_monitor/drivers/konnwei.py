@@ -370,6 +370,7 @@ class KonnweiDriver(Driver):
             if collecting and await session.send(CMD_LOG_STOP) is None:
                 raise DriverError("no reply to stop-logging")
             raw = await session.download()
+            downloaded = False
             if raw is None:
                 error = "no log download"
             else:
@@ -378,20 +379,31 @@ class KonnweiDriver(Driver):
                 except DriverError as err:
                     error = str(err)  # keep the log on the device; retried later
                 else:
-                    if await session.send(CMD_LOG_CLEAR) is None:
-                        error = "no reply to clear-log"
+                    downloaded = True
             # Always restart logging, even if the download failed (the log is kept then).
-            start = int(time.time()) + LOG_START_DELAY
-            entry = schedule_entry(start, LOG_DURATION_MS, LOG_INTERVAL_MS)
-            ack = await session.send(CMD_LOG_WRITE, entry)
+            try:
+                if downloaded and await session.send(CMD_LOG_CLEAR) is None:
+                    # The log stays on the device and the next download repeats these
+                    # records; the import skips hours it already has.
+                    error = "no reply to clear-log"
+                start = int(time.time()) + LOG_START_DELAY
+                entry = schedule_entry(start, LOG_DURATION_MS, LOG_INTERVAL_MS)
+                ack = await session.send(CMD_LOG_WRITE, entry)
+            except (BleakError, EOFError) as err:
+                if not downloaded:
+                    raise
+                error, ack = error or f"link lost after download ({err})", None
             if ack is None or ack.payload[:1] not in (b"", b"\x00"):
                 error = error or "schedule not accepted"
-            self.log_state = {
-                "collecting": True,
-                "ends": start + LOG_DURATION_MS / 1000,
-                "schedules": [(start, LOG_DURATION_MS, LOG_INTERVAL_MS, True)],
-                "free_slots": session.free_slots,
-            }
+                # Unknown whether it's logging: say not, so the next try rewrites it.
+                self.log_state = {"collecting": False, "ends": None, "schedules": []}
+            else:
+                self.log_state = {
+                    "collecting": True,
+                    "ends": start + LOG_DURATION_MS / 1000,
+                    "schedules": [(start, LOG_DURATION_MS, LOG_INTERVAL_MS, True)],
+                    "free_slots": session.free_slots,
+                }
         finally:
             await session.stop()
         self.history_info = {
@@ -400,8 +412,9 @@ class KonnweiDriver(Driver):
             "error": error,
             "at": round(time.time()),
         }
-        if error:
+        if error and not downloaded:
             raise DriverError(error)
+        # Downloaded: return the samples even if a later step failed (history_info says so).
         return samples
 
 

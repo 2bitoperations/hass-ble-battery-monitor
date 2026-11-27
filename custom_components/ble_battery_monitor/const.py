@@ -18,8 +18,10 @@ DEFAULT_NOMINAL_VOLTAGE: Final = 12
 DEFAULT_POLL_INTERVAL: Final = 120  # seconds
 MIN_POLL_INTERVAL: Final = 30
 MAX_POLL_INTERVAL: Final = 3600
-#: Retry sooner than the normal interval after a failed poll.
+#: After a failed poll, wait this long before the first retry; each further failure in a row
+#: doubles it, up to RETRY_MAX. A retry also needs an advert heard since the failed attempt.
 RETRY_INTERVAL: Final = 60
+RETRY_MAX: Final = 600
 
 #: How often to check whether a poll is due (adverts alone aren't enough).
 POLL_TIMER: Final = 30
