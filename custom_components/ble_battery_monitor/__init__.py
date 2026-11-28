@@ -6,6 +6,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from .const import CONF_DRIVER, CONF_MODEL, DOMAIN
@@ -29,6 +30,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BatteryMonitorConfigEntr
     """Set up a monitor from a config entry."""
     driver = DRIVERS[entry.data[CONF_DRIVER]](entry.data[CONF_MODEL])
     coordinator = BatteryMonitorCoordinator(hass, entry, driver)
+    await coordinator.async_load_state()
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     # Start listening last, so entities exist before the first poll lands.
@@ -45,3 +47,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: BatteryMonitorConfigEnt
 
 async def _async_options_updated(hass: HomeAssistant, entry: BatteryMonitorConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: BatteryMonitorConfigEntry) -> None:
+    """Drop the stored last-reading time with the entry."""
+    await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()

@@ -21,7 +21,7 @@ Bluetooth stack so it works through ESPHome Bluetooth proxies.
 - **Polling:** advertisement-triggered. When the monitor is heard and a poll is due, it connects,
   reads, and **disconnects**, so a proxy connection slot is held for a few seconds, not forever.
   Default interval 120 s (Options: 30–3600 s); after a failure it retries sooner (60 s).
-- **Hard timeouts everywhere:** a poll can't hang (45 s overall budget; per-reply timeouts inside).
+- **Hard timeouts everywhere:** a poll can't hang (90 s overall budget: 3 connect attempts of 20 s plus the read; per-reply timeouts inside).
 - **No extra requirements:** AES for the BM6 uses `cryptography`, which ships with HA.
 - **Availability:** the last reading stays shown through short dropouts (3 poll intervals, minimum
   15 min), then goes unavailable. Errors are logged once per outage, not every minute.
@@ -34,8 +34,9 @@ BM2 and BM6 monitors keep their own log (one record every 2 minutes; the BM2 sen
 integration keeps a rolling 24 h schedule on it (a sample every 5 minutes, 288 of its 20480 slots;
 renewed while in range, replacing any schedules set in the KONNWEI app).
 
-When a monitor comes back after being out of range (more than 10 minutes without a good reading), or
-on the first poll after Home Assistant starts, the poll also downloads that log and imports the
+When a monitor comes back after being out of range (more than 10 minutes without a good reading,
+counting time Home Assistant was down; a quick restart doesn't count), or on its first poll after it's
+added, the poll also downloads that log and imports the
 missing hours into the sensors' **long-term statistics** (hourly mean/min/max). The BK400's log is
 cleared after a verified (CRC-checked) download and logging restarts.
 

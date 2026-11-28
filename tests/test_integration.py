@@ -456,3 +456,17 @@ async def test_each_connect_attempt_asks_ha_for_the_best_proxy(hass: HomeAssista
         # bleak-retry-connector calls this before each retry.
         assert kwargs["ble_device_callback"]() is better
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_poll_budget_fits_every_connect_attempt():
+    """Regression: a 45 s budget cut the 3rd 20 s connect attempt off after ~5 s."""
+    from bleak_retry_connector import BLEAK_TIMEOUT
+
+    from custom_components.ble_battery_monitor.const import (
+        CONNECT_ATTEMPT_TIMEOUT,
+        CONNECT_ATTEMPTS,
+        POLL_TIMEOUT,
+    )
+
+    assert CONNECT_ATTEMPT_TIMEOUT >= BLEAK_TIMEOUT
+    assert POLL_TIMEOUT >= CONNECT_ATTEMPTS * CONNECT_ATTEMPT_TIMEOUT + 20  # + time for the read

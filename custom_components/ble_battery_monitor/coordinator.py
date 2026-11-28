@@ -20,6 +20,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -32,6 +33,7 @@ from .const import (
     DEFAULT_HISTORY,
     DEFAULT_NOMINAL_VOLTAGE,
     DEFAULT_POLL_INTERVAL,
+    DOMAIN,
     HISTORY_GAP,
     HISTORY_MAX_AGE,
     HISTORY_RETRY,
@@ -83,8 +85,13 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
         self.lock = asyncio.Lock()
         self._force_poll = False
         #: Start of a gap that still needs backfilling (None = nothing to do).
-        #: Starts out set, so the first poll after startup also covers downtime.
+        #: Starts out set (a fresh install backfills as far as it can); async_load_state()
+        #: narrows it to the real gap, if any, once the last good reading is known.
         self._history_since: float | None = time.time() - HISTORY_MAX_AGE
+        #: Remembers the last good reading across restarts.
+        self._store: Store[dict[str, float]] = Store(
+            hass, 1, f"{DOMAIN}.{entry.entry_id}", private=True
+        )
         self._history_attempt: float | None = None
         self.history_status: dict[str, object] = {}
         #: A step after a good download that wasn't acknowledged (shown in diagnostics).
@@ -98,6 +105,23 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
             poll_method=self._poll,
             connectable=True,
         )
+
+    async def async_load_state(self) -> None:
+        """Restore the last good reading time, so a restart only backfills a real gap.
+
+        Without it every Home Assistant restart re-downloaded the whole device log (the BM2
+        sends ~200 KB, holding a proxy connection ~40 s) and imported nothing.
+        """
+        stored = await self._store.async_load()
+        last = (stored or {}).get("last_success")
+        if not isinstance(last, (int, float)):
+            return
+        self.last_success = float(last)
+        # The first poll's gap check backfills from here if it's been more than HISTORY_GAP.
+        self._history_since = None
+
+    def _async_save_state(self) -> None:
+        self._store.async_delay_save(lambda: {"last_success": self.last_success or 0.0}, 60)
 
     @property
     def poll_interval(self) -> int:
@@ -296,6 +320,7 @@ class BatteryMonitorCoordinator(ActiveBluetoothDataUpdateCoordinator[Reading]):
             )
         self.last_success = time.time()
         self.last_error = None
+        self._async_save_state()
         self._async_update_device_registry()
         if samples is not None:
             await self._async_import(samples)

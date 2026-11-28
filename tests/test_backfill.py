@@ -247,3 +247,67 @@ async def test_bk400_clear_unacknowledged_imports_and_backs_off(hass: HomeAssist
     assert coordinator._history_attempt is not None
     assert not coordinator._history_due()
     assert log.records  # still on the device
+
+
+def _store_key(entry: MockConfigEntry) -> str:
+    return f"{DOMAIN}.{entry.entry_id}"
+
+
+async def _first_poll_history_since(hass, entry, hass_storage, stored: float | None):
+    """Set up with a stored last reading; return the `since` of every history download."""
+    if stored is not None:
+        hass_storage[_store_key(entry)] = {
+            "version": 1,
+            "minor_version": 1,
+            "key": _store_key(entry),
+            "data": {"last_success": stored},
+        }
+    seen: list[float] = []
+    real = leagend.LeagendDriver.async_read_history
+
+    async def spy(self, client, since):
+        seen.append(since)
+        return await real(self, client, since)
+
+    with patch.object(leagend.LeagendDriver, "async_read_history", spy):
+        coordinator = await _setup_and_poll(hass, entry, BM2, bm2_device(history=[12.5] * 5))
+    assert coordinator.last_poll_successful, coordinator.last_error
+    return coordinator, seen
+
+
+async def test_quick_restart_skips_backfill(hass: HomeAssistant, hass_storage) -> None:
+    """Regression: every HA restart re-downloaded the whole BM2 log (~200 KB) for nothing."""
+    entry = _entry()
+    coordinator, seen = await _first_poll_history_since(
+        hass, entry, hass_storage, time.time() - 120
+    )
+    assert seen == []
+    assert coordinator._history_since is None
+
+
+async def test_restart_after_long_downtime_backfills_the_gap(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    entry = _entry()
+    last = time.time() - 3 * 3600
+    _coordinator, seen = await _first_poll_history_since(hass, entry, hass_storage, last)
+    assert seen == [last]  # from the last good reading, not 7 days back
+
+
+async def test_new_entry_backfills_everything(hass: HomeAssistant, hass_storage) -> None:
+    entry = _entry()
+    _coordinator, seen = await _first_poll_history_since(hass, entry, hass_storage, None)
+    assert len(seen) == 1 and seen[0] < time.time() - 6 * 86400
+
+
+async def test_last_reading_is_saved(hass: HomeAssistant, hass_storage) -> None:
+    entry = _entry()
+    coordinator = await _setup_and_poll(hass, entry, BM2, bm2_device(history=[12.5] * 5))
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+    await hass.async_block_till_done()
+    saved = hass_storage[_store_key(entry)]["data"]["last_success"]
+    assert saved == coordinator.last_success
+
+    assert await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert _store_key(entry) not in hass_storage

@@ -26,9 +26,12 @@ RETRY_MAX: Final = 600
 #: How often to check whether a poll is due (adverts alone aren't enough).
 POLL_TIMER: Final = 30
 
-#: Whole connect+read budget; a poll never blocks longer than this.
-POLL_TIMEOUT: Final = 45
 CONNECT_ATTEMPTS: Final = 3
+#: bleak-retry-connector gives each connect attempt this long (its BLEAK_TIMEOUT).
+CONNECT_ATTEMPT_TIMEOUT: Final = 20
+#: Whole connect+read budget; a poll never blocks longer than this. Room for every connect
+#: attempt plus the read (was 45 s, which always cut the 3rd attempt off at ~5 s).
+POLL_TIMEOUT: Final = CONNECT_ATTEMPTS * CONNECT_ATTEMPT_TIMEOUT + 30
 
 #: Keep showing the last reading for this many poll intervals of failures
 #: (at least STALE_MIN seconds) before going unavailable.
